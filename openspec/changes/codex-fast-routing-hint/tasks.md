@@ -1,0 +1,3 @@
+- [x] Add deterministic eligible and excluded outbound route coverage.
+- [x] Synthesize the trusted hint in shared HTTP and WebSocket builders.
+- [x] Run focused tests and repository validation.
