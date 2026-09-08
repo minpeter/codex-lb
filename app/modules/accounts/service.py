@@ -42,6 +42,7 @@ from app.db.session import get_background_session
 from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.deletion import request_account_deletion_run
 from app.modules.accounts.mappers import build_account_summaries, build_account_usage_trends
+from app.modules.accounts.remote_credentials import get_remote_credentials, remote_mode_enabled
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.schemas import (
     AccountAdditionalQuota,
@@ -513,6 +514,8 @@ class AccountsService:
         )
 
     async def import_account(self, raw: bytes) -> AccountImportResponse:
+        if remote_mode_enabled():
+            raise InvalidAuthJsonError("Local account import is disabled in remote credential mode")
         try:
             auth = parse_auth_json(raw)
         except (json.JSONDecodeError, ValidationError, UnicodeDecodeError, TypeError) as exc:
@@ -603,6 +606,15 @@ class AccountsService:
         return True
 
     async def reactivate_account(self, account_id: str) -> bool:
+        if remote_mode_enabled():
+            try:
+                async with get_remote_credentials().local_reactivation(account_id):
+                    return await self._reactivate_account(account_id)
+            except RefreshError:
+                raise AccountStateTransitionError("Source account is unavailable for local reactivation") from None
+        return await self._reactivate_account(account_id)
+
+    async def _reactivate_account(self, account_id: str) -> bool:
         account = await self._repo.get_by_id(account_id)
         if account is None:
             return False

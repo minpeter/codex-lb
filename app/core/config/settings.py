@@ -12,7 +12,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from dotenv import dotenv_values
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.core.auth.dashboard_mode import DashboardAuthMode, normalize_dashboard_auth_proxy_header
@@ -297,6 +297,11 @@ class Settings(BaseSettings):
     oauth_timeout_seconds: float = 30.0
     oauth_callback_host: str = _default_oauth_callback_host()
     token_refresh_timeout_seconds: float = 8.0
+    remote_credential_source_url: str | None = None
+    remote_credential_source_password: SecretStr | None = Field(default=None, repr=False)
+    remote_credential_source_password_file: Path | None = None
+    remote_credential_source_sync_interval_seconds: float = Field(default=60.0, gt=0)
+    remote_credential_source_timeout_seconds: float = Field(default=8.0, gt=0)
     # Cross-replica token-refresh claim (account_refresh_claims table).
     # The TTL bounds how long a crashed claimant can block refresh for one
     # account; it is validated to stay >= proxy_admission_wait_timeout_seconds
@@ -694,6 +699,34 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _apply_data_dir_defaults(self) -> "Settings":
+        url = self.remote_credential_source_url
+        password = self.remote_credential_source_password
+        password_file = self.remote_credential_source_password_file
+        if url is not None:
+            parsed = urlparse(url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or any(c.isspace() for c in url)
+            ):
+                raise ValueError(
+                    "remote credential source must be an HTTP(S) URL without credentials, query or fragment"
+                )
+            try:
+                parsed.port
+            except ValueError:
+                raise ValueError("remote credential source has an invalid port") from None
+            if (password is None) == (password_file is None):
+                raise ValueError("remote credential source requires exactly one password or password_file")
+            if password is not None and not password.get_secret_value().strip():
+                raise ValueError("remote credential source password must not be empty")
+            self.remote_credential_source_url = url.rstrip("/")
+        elif password is not None or password_file is not None:
+            raise ValueError("remote credential source password requires a source URL")
         if self.data_dir == DEFAULT_HOME_DIR:
             return self
         explicitly_set = self.model_fields_set

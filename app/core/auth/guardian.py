@@ -270,8 +270,12 @@ def build_auth_guardian_scheduler() -> AuthGuardianScheduler:
     # leader" escape hatch: concurrent force token refreshes across replicas
     # can invalidate rotated refresh tokens, so without election the guardian
     # must not run in a multi-replica ring at all.
-    enabled = settings.auth_guardian_enabled and (settings.leader_election_enabled or not multi_replica)
-    if settings.auth_guardian_enabled and not enabled:
+    enabled = (
+        settings.auth_guardian_enabled
+        and settings.remote_credential_source_url is None
+        and (settings.leader_election_enabled or not multi_replica)
+    )
+    if settings.auth_guardian_enabled and not enabled and settings.remote_credential_source_url is None:
         logger.warning(
             "Auth Guardian disabled: multi-replica deployment without leader election; "
             "set CODEX_LB_LEADER_ELECTION_ENABLED=true to run it leader-gated"

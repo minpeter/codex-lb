@@ -448,6 +448,8 @@ class OauthService:
         return record
 
     async def start_oauth(self, request: OauthStartRequest) -> OauthStartResponse:
+        if get_settings().remote_credential_source_url is not None:
+            raise OAuthError("remote_credential_mode", "Local OAuth is disabled in remote credential mode")
         force_method = (request.force_method or "").lower()
         intended_account_id = clean_account_identity_part(request.account_id)
         if not force_method and not intended_account_id:
@@ -951,6 +953,8 @@ class OauthService:
         *,
         intended_account_id: str | None,
     ) -> Account:
+        if get_settings().remote_credential_source_url is not None:
+            raise OAuthError("remote_credential_mode", "Local OAuth is disabled in remote credential mode")
         if intended_account_id is None:
             return await repo.upsert_account_slot(
                 account,

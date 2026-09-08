@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import case, delete, func, or_, select, text, update
+from sqlalchemy import case, delete, func, or_, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.auth import extract_id_token_claims, resolve_seat_identity
+from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.core.utils.time import utcnow
@@ -189,6 +191,17 @@ class AccountIdentityConflictError(Exception):
 
 class AccountIdentityRelockError(RuntimeError):
     """Raised after identity membership changes across both bounded lock attempts."""
+
+
+def _local_status_write_allowed(status: AccountStatus) -> ColumnElement[bool]:
+    if get_settings().remote_credential_source_url is None or status in {
+        AccountStatus.PAUSED,
+        AccountStatus.DEACTIVATED,
+    }:
+        return true()
+    # Stale inference/usage settlements cannot undo source-owned state. Remote
+    # synchronization writes through its own repository, not this local funnel.
+    return or_(Account.deactivation_reason.is_(None), ~Account.deactivation_reason.startswith("remote_source:"))
 
 
 class AccountsRepository:
@@ -750,6 +763,7 @@ class AccountsRepository:
                 # selectable again mid-drain. Only a credential replacement
                 # (which clears the marker) may resurrect the row.
                 .where(Account.delete_requested_at.is_(None))
+                .where(_local_status_write_allowed(status))
                 .values(**values)
                 .returning(Account.id)
             )
@@ -803,6 +817,7 @@ class AccountsRepository:
                 update(Account)
                 .where(Account.id == account_id)
                 .where(Account.status == expected_status)
+                .where(_local_status_write_allowed(status))
                 # Same pending-deletion fence as ``update_status``: marked
                 # rows are terminal for ordinary status writers.
                 .where(Account.delete_requested_at.is_(None))

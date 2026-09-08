@@ -35,6 +35,7 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, AccountProxyBinding, AccountStatus
 from app.db.session import get_background_session
 from app.modules.accounts.refresh_claims import RefreshClaimCoordinatorPort, get_refresh_claim_coordinator
+from app.modules.accounts.remote_credentials import get_remote_credentials, remote_mode_enabled
 from app.modules.proxy.account_cache import get_account_selection_cache, mark_account_routing_unavailable
 
 
@@ -287,6 +288,8 @@ class AuthManager:
         self._refresh_claims = refresh_claims
 
     async def ensure_fresh(self, account: Account, *, force: bool = False) -> Account:
+        if remote_mode_enabled():
+            return await get_remote_credentials().ensure_fresh(account, force=force)
         if force or (account.status != AccountStatus.REAUTH_REQUIRED and should_refresh(account.last_refresh)):
             account = await _REFRESH_SINGLEFLIGHT.run(
                 _refresh_singleflight_key(self._encryptor, account),
@@ -318,6 +321,8 @@ class AuthManager:
         # work after the shared task (for example the account-id metadata
         # backfill) retains the caller's explicit policy.
         if self._refresh_repo_factory is None:
+            if remote_mode_enabled():
+                return await get_remote_credentials().ensure_fresh(account, force=True)
             owned = AuthManager(
                 self._repo,
                 acquire_refresh_admission=self._acquire_refresh_admission,
@@ -340,6 +345,8 @@ class AuthManager:
         return value
 
     async def refresh_account(self, account: Account) -> Account:
+        if remote_mode_enabled():
+            return await get_remote_credentials().ensure_fresh(account, force=True)
         claims = self._refresh_claims if self._refresh_claims is not None else get_refresh_claim_coordinator()
         if claims is None:
             requested_fingerprint = _refresh_token_material_fingerprint(

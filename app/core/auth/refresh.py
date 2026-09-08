@@ -168,7 +168,9 @@ def is_transient_refresh_contention(exc: RefreshError) -> bool:
     (benign) and ``is_refresh_persist_conflict`` (post-exchange) for observability;
     both take the same unpenalized retryable failover path here.
     """
-    return exc.transport_error and exc.code in TRANSIENT_REFRESH_CONTENTION_CODES
+    return exc.transport_error and (
+        exc.code in TRANSIENT_REFRESH_CONTENTION_CODES or exc.code == "remote_credentials_unavailable"
+    )
 
 
 def refresh_contention_kind(exc: RefreshError) -> str | None:
@@ -211,6 +213,13 @@ async def refresh_access_token(
     allow_direct_egress: bool = False,
 ) -> TokenRefreshResult:
     settings = get_settings()
+    if settings.remote_credential_source_url is not None:
+        raise RefreshError(
+            "remote_credentials_unavailable",
+            "OAuth refresh is disabled in remote credential mode",
+            False,
+            transport_error=True,
+        )
     url = f"{AUTH_BASE_URL}/oauth/token"
     payload = {
         "grant_type": "refresh_token",

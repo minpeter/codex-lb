@@ -75,6 +75,7 @@ from app.db.session import (
 )
 from app.modules.accounts import api as accounts_api
 from app.modules.accounts.deletion import build_account_deletion_scheduler
+from app.modules.accounts.remote_credentials import RemoteCredentials, set_remote_credentials
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.usage_rollup_scheduler import build_account_usage_rollup_scheduler
 from app.modules.api_keys import api as api_keys_api
@@ -631,6 +632,11 @@ async def lifespan(app: FastAPI):
     # even if a nested lifespan on another loop replaces the module-global
     # singleton in the meantime; shutdown below stops exactly this instance.
     live_usage_ingestor = start_live_usage_ingestor()
+    remote_credentials = None
+    if settings.remote_credential_source_url is not None:
+        remote_credentials = RemoteCredentials(settings)
+        await remote_credentials.start()
+        set_remote_credentials(remote_credentials)
     await usage_scheduler.start()
     await api_key_limit_reset_scheduler.start()
     await api_key_last_used_flush_scheduler.start()
@@ -872,6 +878,8 @@ async def lifespan(app: FastAPI):
         await account_deletion_scheduler.stop()
         await data_retention_scheduler.stop()
         await telemetry_scheduler.stop()
+        if remote_credentials is not None:
+            await remote_credentials.close()
         # Release the scheduler leader lease only after every leader-gated
         # scheduler has stopped so no local tick re-acquires it; followers can
         # then take over immediately instead of waiting out the lease TTL.
