@@ -19,6 +19,22 @@ should use source token timestamps to avoid exporting every account on every
 tick. Concurrent recovery callers should share bounded work rather than amplify
 source load.
 
+## Configuration budget
+
+The fork's remote integration adds exactly five named fields while preserving
+the upstream settings ratchet of 133 fields. The generated settings reference
+includes both surfaces; the fork allowance must not admit unrelated settings.
+
+- Source URL selects the deployment-specific credential authority and enables
+  the otherwise disabled mode; it cannot have a universal default.
+- Password and password-file are mutually exclusive authentication inputs.
+  The file form supports protected container secret mounts; the inline form
+  supports environment-based secret injection and isolated test instances.
+- Sync interval balances source account-state propagation against source
+  dashboard load, including export audit writes.
+- Whole-cycle timeout depends on source latency and account-pool size; a
+  19-account remote bootstrap can require a larger budget than a local fixture.
+
 Example: `codex.nekos.me` manages accounts, while
 `codex.minpeter.internal` reads that dashboard API and sends inference directly
 to ChatGPT. Internal deployment details are in

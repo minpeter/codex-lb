@@ -7,7 +7,7 @@ Regenerate with `uv run python scripts/generate_settings_reference.py`;
 `tests/unit/test_settings_reference.py` fails when this page drifts from
 `app/core/config/settings.py`.
 
-codex-lb currently exposes 133 settings. Every setting is an environment
+codex-lb currently exposes 138 settings. Every setting is an environment
 variable with the `CODEX_LB_` prefix (process environment or `.env` /
 `.env.local` next to the process). All defaults work with zero configuration —
 start from [Configuration](../configuration.md) for the handful that matter,
@@ -263,6 +263,11 @@ the env-file locations have to be known before env files are read.
 | Environment variable | Type | Default |
 | --- | --- | --- |
 | `CODEX_LB_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS` | `float` | `0.5` |
+| `CODEX_LB_REMOTE_CREDENTIAL_SOURCE_PASSWORD` | `SecretStr \| None` | `None` |
+| `CODEX_LB_REMOTE_CREDENTIAL_SOURCE_PASSWORD_FILE` | `Path \| None` | `None` |
+| `CODEX_LB_REMOTE_CREDENTIAL_SOURCE_SYNC_INTERVAL_SECONDS` | `float` | `60.0` |
+| `CODEX_LB_REMOTE_CREDENTIAL_SOURCE_TIMEOUT_SECONDS` | `float` | `8.0` |
+| `CODEX_LB_REMOTE_CREDENTIAL_SOURCE_URL` | `str \| None` | `None` |
 | `CODEX_LB_TELEMETRY_ENABLED` | `bool \| None` | `None` |
 | `CODEX_LB_TELEMETRY_ENDPOINT` | `str` | `'https://telemetry.tokmaxxing.com'` |
 | `CODEX_LB_TIMEOUT_INVARIANT_VALIDATION_STRICT` | `bool` | `False` |

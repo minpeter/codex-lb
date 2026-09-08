@@ -78,6 +78,19 @@ ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 # asked for it to be promoted to a setting on PR #1633 (2026-08-20/08-26),
 # consistent with that PR's budget-from-settings principle.
 MAX_SETTINGS_FIELDS = 133
+# This fork adds one explicitly bounded integration surface. Keep the upstream
+# ratchet unchanged and permit only these five named fields, not arbitrary
+# growth. The why-not-a-default rationale is recorded in the owning capability
+# context; generated docs still enumerate all fields, including this surface.
+REMOTE_CREDENTIAL_SETTINGS_FIELDS = frozenset(
+    {
+        "remote_credential_source_url",
+        "remote_credential_source_password",
+        "remote_credential_source_password_file",
+        "remote_credential_source_sync_interval_seconds",
+        "remote_credential_source_timeout_seconds",
+    }
+)
 
 
 def test_generated_settings_reference_matches_code() -> None:
@@ -95,8 +108,12 @@ def test_settings_reference_page_is_checked_in_under_docs() -> None:
 
 
 def test_settings_surface_ratchet() -> None:
-    assert len(Settings.model_fields) <= MAX_SETTINGS_FIELDS, (
-        f"Settings grew to {len(Settings.model_fields)} fields (ratchet: {MAX_SETTINGS_FIELDS}). "
+    fields = set(Settings.model_fields)
+    remote_fields = {name for name in fields if name.startswith("remote_credential_")}
+    assert remote_fields == REMOTE_CREDENTIAL_SETTINGS_FIELDS
+    upstream_fields = fields - remote_fields
+    assert len(upstream_fields) <= MAX_SETTINGS_FIELDS, (
+        f"Upstream Settings grew to {len(upstream_fields)} fields (ratchet: {MAX_SETTINGS_FIELDS}). "
         "New settings need a simplicity-budget discussion (PRINCIPLES.md P2, issue #1340); "
         "lower MAX_SETTINGS_FIELDS when fields are removed."
     )

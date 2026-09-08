@@ -17,6 +17,7 @@ from aiohttp.client_reqrep import ConnectionKey
 import app.core.auth.refresh as refresh_module
 import app.core.clients.model_fetcher as model_fetcher_module
 import app.core.openai.model_refresh_scheduler as scheduler_module
+from app.core.config.settings import Settings
 from app.core.openai.model_registry import ReasoningLevel, UpstreamModel
 from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
 from app.db.models import Account, AccountStatus
@@ -115,9 +116,7 @@ async def test_refresh_access_token_marks_transport_errors(monkeypatch: pytest.M
     monkeypatch.setattr(
         refresh_module,
         "get_settings",
-        lambda: SimpleNamespace(
-            token_refresh_timeout_seconds=15.0,
-        ),
+        lambda: Settings(token_refresh_timeout_seconds=15.0),
     )
 
     with pytest.raises(refresh_module.RefreshError) as excinfo:
@@ -137,12 +136,7 @@ async def test_refresh_access_token_preserves_transient_dns_classification(monke
     monkeypatch.setattr(
         refresh_module,
         "get_settings",
-        lambda: SimpleNamespace(
-            auth_base_url="https://auth.example.test",
-            oauth_client_id="client-id",
-            oauth_scope="openid profile",
-            token_refresh_timeout_seconds=15.0,
-        ),
+        lambda: Settings(token_refresh_timeout_seconds=15.0),
     )
 
     with pytest.raises(refresh_module.RefreshError) as exc_info:
@@ -167,12 +161,7 @@ async def test_refresh_access_token_marks_typed_connector_dns_failure_replay_saf
     monkeypatch.setattr(
         refresh_module,
         "get_settings",
-        lambda: SimpleNamespace(
-            auth_base_url="https://auth.example.test",
-            oauth_client_id="client-id",
-            oauth_scope="openid profile",
-            token_refresh_timeout_seconds=15.0,
-        ),
+        lambda: Settings(token_refresh_timeout_seconds=15.0),
     )
 
     with pytest.raises(refresh_module.RefreshError) as exc_info:
@@ -208,12 +197,7 @@ async def test_refresh_access_token_network_body_read_failure_is_not_replay_safe
     monkeypatch.setattr(
         refresh_module,
         "get_settings",
-        lambda: SimpleNamespace(
-            auth_base_url="https://auth.example.test",
-            oauth_client_id="client-id",
-            oauth_scope="openid profile",
-            token_refresh_timeout_seconds=15.0,
-        ),
+        lambda: Settings(token_refresh_timeout_seconds=15.0),
     )
 
     with pytest.raises(refresh_module.RefreshError) as exc_info:
