@@ -1,5 +1,5 @@
-- [ ] Capture configurable-level and invalid-value RED tests.
-- [ ] Implement bounded setting and policy wiring; document exact setting budget.
-- [ ] Pass overload/settings/remote regressions and static checks.
-- [ ] Build and deploy B with level2 and900 seconds, preserving21600 sync.
-- [ ] Verify runtime isolation behavior, health and actual Astra response.
+- [x] Capture configurable-level and invalid-value RED tests.
+- [x] Implement bounded setting and policy wiring; document exact setting budget.
+- [x] Pass overload/settings/remote regressions and static checks.
+- [x] Build and deploy B with level2 and900 seconds, preserving21600 sync.
+- [x] Verify runtime isolation behavior, health and actual Astra response.
