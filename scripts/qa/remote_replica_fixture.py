@@ -7,6 +7,12 @@ Pause/remove affect source metadata only; source-up restores availability only.
 Rotate accepts the new and immediately previous token; reject-old-token retires
 that previous token. Restart resets all state. Counters count attempts, including
 rejected requests. No timers, external requests, or genuine credentials are used.
+Opt in with --multi-account for two accounts and OVERLOAD_OK output. Configure
+POST /control/state with {"action":"overload","target":"remote-account-1",
+"mode":"persistent"}; mode is off, once, or persistent. Each configuration
+clears only QA attempts/counters, not credentials, file/response IDs, or totals.
+HTTP 500 server_is_overloaded is returned before any SSE output. GET control
+state exposes ordered attempts, account counts, and token fingerprints (not JWTs).
 Uses the project's environment and schemas intentionally, not a PEP 723 sandbox.
 """
 
@@ -23,11 +29,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Final, Literal, assert_never
 
 from aiohttp import web
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.core.auth import IdTokenClaims, OpenAIAuthClaims
 from app.core.openai.models import OpenAIError, OpenAIErrorEnvelope, OpenAIResponsePayload, ResponseUsage
-from app.core.openai.requests import ResponsesRequest
+from app.core.openai.requests import ResponsesRequest, extract_input_file_ids
 from app.core.types import JsonObject
 from app.core.usage.models import RateLimitPayload, UsagePayload, UsageWindow
 from app.modules.accounts.schemas import (
@@ -47,11 +53,26 @@ from app.modules.dashboard_auth.service import DASHBOARD_SESSION_COOKIE
 ACCOUNT_ID: Final = "remote-account-1"
 EMAIL: Final = "replica-qa@example.invalid"
 PASSWORD: Final = "qa-source-password"
+SECOND_ACCOUNT_ID: Final = "remote-account-2"
 
 
 class ControlRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-    action: Literal["rotate", "source-down", "source-up", "pause", "remove", "expire-session", "reject-old-token"]
+    action: Literal[
+        "rotate", "source-down", "source-up", "pause", "remove", "expire-session", "reject-old-token", "overload"
+    ]
+    target: Literal["remote-account-1", "remote-account-2"] = ACCOUNT_ID
+    mode: Literal["off", "once", "persistent"] = "off"
+
+
+class QAAttempt(BaseModel):
+    account_id: str | None
+    account_header: str | None
+    token_fingerprint: str
+    operation: Literal["inference", "file-create"]
+    previous_response_id: str | None = None
+    file_ids: list[str] = Field(default_factory=list)
+    status: int = 200
 
 
 class State(BaseModel):
@@ -68,6 +89,13 @@ class State(BaseModel):
     inference_attempts: int = 0
     usage_attempts: int = 0
     refresh_attempts: int = 0
+    overload_target: str = ACCOUNT_ID
+    overload_mode: Literal["off", "once", "persistent"] = "off"
+    overload_hits: int = 0
+    qa_attempts: list[QAAttempt] = Field(default_factory=list)
+    inference_by_account: dict[str, int] = Field(default_factory=dict)
+    file_owners: dict[str, str] = Field(default_factory=dict)
+    response_owners: dict[str, str] = Field(default_factory=dict)
 
 
 class Event(BaseModel):
@@ -103,6 +131,7 @@ def encode(raw: bytes) -> str:
 class Fixture:
     """One event-loop-owned state machine, mutated only by incoming HTTP requests."""
 
+    multi_account: bool = False
     state: State = field(default_factory=State)
     sessions: set[str] = field(default_factory=set)
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC).replace(microsecond=0))
@@ -111,14 +140,18 @@ class Fixture:
     def refreshed_at(self) -> datetime:
         return self.started_at + timedelta(seconds=self.state.generation - 1)
 
-    def token(self, generation: int, kind: str = "access") -> str:
+    @property
+    def account_ids(self) -> tuple[str, ...]:
+        return (ACCOUNT_ID, SECOND_ACCOUNT_ID) if self.multi_account else (ACCOUNT_ID,)
+
+    def token(self, generation: int, kind: str = "access", account_id: str = ACCOUNT_ID) -> str:
         claims = IdTokenClaims.model_validate(
             {
                 "email": EMAIL,
                 "sub": "fixture-user-1",
                 "exp": int(self.started_at.timestamp()) + 86400 + generation,
                 "https://api.openai.com/auth": OpenAIAuthClaims(
-                    chatgpt_account_id=ACCOUNT_ID, chatgpt_plan_type="plus"
+                    chatgpt_account_id=account_id, chatgpt_plan_type="plus"
                 ),
             }
         ).model_dump(by_alias=True, exclude_none=True)
@@ -134,11 +167,46 @@ class Fixture:
             return error(401, "authentication_required")
         return None
 
+    def authenticated_account(self, request: web.Request) -> str | None:
+        for account_id in self.account_ids:
+            valid = {self.token(self.state.generation, account_id=account_id)}
+            if self.state.accept_previous_token and self.state.generation > 1:
+                valid.add(self.token(self.state.generation - 1, account_id=account_id))
+            if request.headers.get("Authorization", "") in {f"Bearer {token}" for token in valid}:
+                return account_id
+        return None
+
     def authorized(self, request: web.Request) -> bool:
-        valid = {self.token(self.state.generation)}
-        if self.state.accept_previous_token and self.state.generation > 1:
-            valid.add(self.token(self.state.generation - 1))
-        return request.headers.get("Authorization", "") in {f"Bearer {token}" for token in valid}
+        account_id = self.authenticated_account(request)
+        return account_id is not None and (
+            not self.multi_account or request.headers.get("chatgpt-account-id") == account_id
+        )
+
+    def record_attempt(self, request: web.Request, operation: Literal["inference", "file-create"]) -> QAAttempt:
+        attempt = QAAttempt(
+            account_id=self.authenticated_account(request),
+            account_header=request.headers.get("chatgpt-account-id"),
+            token_fingerprint=hashlib.sha256(request.headers.get("Authorization", "").encode()).hexdigest()[:16],
+            operation=operation,
+        )
+        self.state.qa_attempts.append(attempt)
+        if operation == "inference" and attempt.account_id is not None:
+            counts = self.state.inference_by_account
+            counts[attempt.account_id] = counts.get(attempt.account_id, 0) + 1
+        return attempt
+
+    async def file_create(self, request: web.Request) -> web.Response:
+        attempt = self.record_attempt(request, "file-create")
+        if not self.authorized(request):
+            attempt.status = 401
+            return error(401, "invalid_api_key")
+        await request.json()
+        account_id = self.authenticated_account(request)
+        assert account_id is not None
+        file_id = f"file_fixture_{len(self.state.file_owners) + 1}"
+        self.state.file_owners[file_id] = account_id
+        # Registration alone persists B's owner pin; no blob upload is needed.
+        return web.json_response({"file_id": file_id})
 
     async def login(self, request: web.Request) -> web.Response:
         self.state.login_attempts += 1
@@ -174,22 +242,28 @@ class Fixture:
             status=self.state.account_status,
             last_refresh_at=self.refreshed_at,
         )
-        return json_response(AccountsResponse(accounts=[account] if self.state.account_present else []))
+        accounts = [
+            account.model_copy(update={"account_id": account_id, "chatgpt_account_id": account_id})
+            for account_id in self.account_ids
+        ]
+        return json_response(AccountsResponse(accounts=accounts if self.state.account_present else []))
 
     async def export(self, request: web.Request) -> web.Response:
         self.state.export_attempts += 1
         if (failure := self.source_error(request)) is not None:
             return failure
-        if not self.state.account_present or request.match_info["id"] != ACCOUNT_ID:
+        account_id = request.match_info["id"]
+        if not self.state.account_present or account_id not in self.account_ids:
             return error(404, "account_not_found")
-        access, identity = self.token(self.state.generation), self.token(self.state.generation, "id")
+        access = self.token(self.state.generation, account_id=account_id)
+        identity = self.token(self.state.generation, "id", account_id)
         refresh = "trap-refresh-token"
         expires = (int(self.started_at.timestamp()) + 86400 + self.state.generation) * 1000
         response = json_response(
             AccountAuthExportResponse(
                 filename="replica-qa-auth.json",
                 account=AccountOpenCodeAuthExportAccount(
-                    account_id=ACCOUNT_ID, chatgpt_account_id=ACCOUNT_ID, email=EMAIL
+                    account_id=account_id, chatgpt_account_id=account_id, email=EMAIL
                 ),
                 tokens=AccountAuthExportTokens(
                     access_token=access,
@@ -202,7 +276,7 @@ class Fixture:
                         access_token=access,
                         id_token=identity,
                         refresh_token=refresh,
-                        account_id=ACCOUNT_ID,
+                        account_id=account_id,
                     ),
                     last_refresh=self.refreshed_at.isoformat().replace("+00:00", "Z"),
                 ),
@@ -211,7 +285,7 @@ class Fixture:
                         access=access,
                         refresh=refresh,
                         expires=expires,
-                        account_id=ACCOUNT_ID,
+                        account_id=account_id,
                     )
                 ),
             )
@@ -223,10 +297,24 @@ class Fixture:
 
     async def inference(self, request: web.Request) -> web.StreamResponse:
         self.state.inference_attempts += 1
+        attempt = self.record_attempt(request, "inference") if self.multi_account else None
         if not self.authorized(request):
+            if attempt is not None:
+                attempt.status = 401
             return error(401, "invalid_api_key")
         payload = ResponsesRequest.model_validate_json(await request.read())
-        part: JsonObject = {"type": "output_text", "text": "REPLICA_OK", "annotations": [], "logprobs": []}
+        if attempt is not None:
+            attempt.previous_response_id = payload.previous_response_id
+            attempt.file_ids = sorted(extract_input_file_ids(payload.input))
+            if attempt.account_id == self.state.overload_target and (
+                self.state.overload_mode == "persistent"
+                or (self.state.overload_mode == "once" and self.state.overload_hits == 0)
+            ):
+                self.state.overload_hits += 1
+                attempt.status = 500
+                return error(500, "server_is_overloaded")
+        output_text = "OVERLOAD_OK" if self.multi_account else "REPLICA_OK"
+        part: JsonObject = {"type": "output_text", "text": output_text, "annotations": [], "logprobs": []}
         item: JsonObject = {
             "id": "msg_fixture",
             "type": "message",
@@ -245,6 +333,8 @@ class Fixture:
                 "usage": ResponseUsage(input_tokens=5, output_tokens=3, total_tokens=8),
             }
         )
+        if attempt is not None and attempt.account_id is not None:
+            self.state.response_owners[f"resp_fixture_{self.state.inference_attempts}"] = attempt.account_id
         events = [
             Event(
                 type="response.created",
@@ -271,7 +361,7 @@ class Fixture:
                 output_index=0,
                 content_index=0,
                 item_id="msg_fixture",
-                delta="REPLICA_OK",
+                delta=output_text,
                 logprobs=[],
             ),
             Event(
@@ -279,7 +369,7 @@ class Fixture:
                 output_index=0,
                 content_index=0,
                 item_id="msg_fixture",
-                text="REPLICA_OK",
+                text=output_text,
                 logprobs=[],
             ),
             Event(type="response.content_part.done", output_index=0, content_index=0, item_id="msg_fixture", part=part),
@@ -319,6 +409,14 @@ class Fixture:
         if request.method == "POST":
             payload = ControlRequest.model_validate_json(await request.read())
             match payload.action:
+                case "overload":
+                    if not self.multi_account:
+                        return error(400, "multi_account_required")
+                    self.state.overload_target = payload.target
+                    self.state.overload_mode = payload.mode
+                    self.state.overload_hits = 0
+                    self.state.qa_attempts.clear()
+                    self.state.inference_by_account.clear()
                 case "rotate":
                     self.state.generation += 1
                     self.state.accept_previous_token = True
@@ -352,8 +450,9 @@ async def parse_errors(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=2467)
+    parser.add_argument("--multi-account", action="store_true")
     args = parser.parse_args()
-    fixture = Fixture()
+    fixture = Fixture(multi_account=args.multi_account)
     app = web.Application(middlewares=[parse_errors])
     app.add_routes(
         [
@@ -367,6 +466,8 @@ def main() -> None:
             web.post("/control/state", fixture.control),
         ]
     )
+    if args.multi_account:
+        app.router.add_post("/backend-api/files", fixture.file_create)
     web.run_app(app, host="127.0.0.1", port=args.port, access_log=None)
 
 

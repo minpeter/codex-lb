@@ -476,6 +476,7 @@ class _StreamingRetryMixin:
         post_refresh_transient_replacement_selected = False
         require_security_work_authorized = False
         account_leases: list[AccountLease] = []
+        pending_overload_selection: AccountSelection | None = None
         estimated_lease_tokens = _facade()._estimated_lease_tokens_from_request_usage_budget(
             estimate_api_key_request_usage(payload)
         )
@@ -809,6 +810,57 @@ class _StreamingRetryMixin:
             )
             return True
 
+        async def _select_overload_replacement(
+            account: Account,
+            error_code: str,
+            current_settlement: _StreamSettlement,
+        ) -> bool:
+            nonlocal pending_overload_selection
+            if (
+                error_code not in UPSTREAM_OVERLOAD_CODES
+                or current_settlement.downstream_visible
+                or attempt >= max_attempts - 1
+                or proxy._remaining_budget_seconds(deadline) <= 0
+                or routing_strategy == "single_account"
+                or require_preferred_account
+                or file_preferred_account_id is not None
+                or turn_state_owner_account_id is not None
+                or payload_replay_required_account_id is not None
+                or payload.previous_response_id is not None
+                or not responses_payload_is_account_neutral_fresh_replay(payload.to_replay_safety_payload())
+            ):
+                return False
+            # This is admission, not a candidate-count probe. Preserve ordinary
+            # scope, affinity, capability and lease policy; a miss must leave the
+            # current account eligible for its existing same-account retry.
+            replacement = await proxy._select_account_with_budget_compatible(
+                deadline,
+                request_id=request_id,
+                kind="stream",
+                api_key=api_key,
+                affinity_policy=affinity,
+                prefer_earlier_reset_accounts=prefer_earlier_reset,
+                prefer_earlier_reset_window=_facade()._prefer_earlier_reset_window(settings),
+                routing_strategy=routing_strategy,
+                model=payload.model,
+                service_tier=payload.service_tier,
+                exclude_account_ids=excluded_account_ids | {account.id},
+                preferred_account_id=preferred_account_id,
+                require_security_work_authorized=require_security_work_authorized,
+                lease_kind="stream",
+                estimated_lease_tokens=estimated_lease_tokens,
+                fallback_on_preferred_account_unavailable=True,
+            )
+            if replacement.account is None:
+                return False
+            # Own the admitted lease before health writes, old-lease release,
+            # generator close, or any other cancellable await. The outer loop
+            # consumes this exact selection without selecting or leasing again.
+            if replacement.lease is not None:
+                account_leases.append(replacement.lease)
+            pending_overload_selection = replacement
+            return True
+
         async def _stream_post_refresh_with_capacity_recovery(
             account: Account,
             *,
@@ -937,8 +989,10 @@ class _StreamingRetryMixin:
                             openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
                         ) from exc
                     transient_retries += 1
+                    overload_replacement_selected = await _select_overload_replacement(account, exc.code, settlement)
                     if (
-                        transient_retries < _facade()._MAX_TRANSIENT_SAME_ACCOUNT_RETRIES
+                        not overload_replacement_selected
+                        and transient_retries < _facade()._MAX_TRANSIENT_SAME_ACCOUNT_RETRIES
                         and proxy._remaining_budget_seconds(deadline) > 0
                         and not settlement.downstream_visible
                     ):
@@ -1265,29 +1319,35 @@ class _StreamingRetryMixin:
                         require_preferred_account or payload_replay_required_account_id is not None
                     )
                     try:
-                        selection = await proxy._select_account_with_budget_compatible(
-                            deadline,
-                            request_id=request_id,
-                            kind="stream",
-                            api_key=api_key,
-                            affinity_policy=affinity,
-                            prefer_earlier_reset_accounts=prefer_earlier_reset,
-                            prefer_earlier_reset_window=_facade()._prefer_earlier_reset_window(settings),
-                            routing_strategy=routing_strategy,
-                            model=payload.model,
-                            service_tier=payload.service_tier,
-                            exclude_account_ids=excluded_account_ids,
-                            preferred_account_id=effective_preferred_account_id,
-                            require_security_work_authorized=require_security_work_authorized,
-                            lease_kind="stream",
-                            estimated_lease_tokens=estimated_lease_tokens,
-                            # Keep stored-object and file ownership strict. The
-                            # verified-fresh replay branch below removes its
-                            # anchor before it permits cross-account movement.
-                            fallback_on_preferred_account_unavailable=not (
-                                effective_require_preferred_account or file_required_preferred_account
-                            ),
-                        )
+                        if pending_overload_selection is not None:
+                            selection = pending_overload_selection
+                            pending_overload_selection = None
+                        else:
+                            selection = await proxy._select_account_with_budget_compatible(
+                                deadline,
+                                request_id=request_id,
+                                kind="stream",
+                                api_key=api_key,
+                                affinity_policy=affinity,
+                                prefer_earlier_reset_accounts=prefer_earlier_reset,
+                                prefer_earlier_reset_window=_facade()._prefer_earlier_reset_window(settings),
+                                routing_strategy=routing_strategy,
+                                model=payload.model,
+                                service_tier=payload.service_tier,
+                                exclude_account_ids=excluded_account_ids,
+                                preferred_account_id=effective_preferred_account_id,
+                                require_security_work_authorized=require_security_work_authorized,
+                                lease_kind="stream",
+                                estimated_lease_tokens=estimated_lease_tokens,
+                                # Keep stored-object and file ownership strict. The
+                                # verified-fresh replay branch below removes its
+                                # anchor before it permits cross-account movement.
+                                fallback_on_preferred_account_unavailable=not (
+                                    effective_require_preferred_account or file_required_preferred_account
+                                ),
+                            )
+                            if selection.lease is not None:
+                                account_leases.append(selection.lease)
                     except ProxyResponseError as exc:
                         await _drain_pending_post_refresh_penalty_on_terminal(settlement)
                         error = _parse_openai_error(exc.payload)
@@ -1326,8 +1386,6 @@ class _StreamingRetryMixin:
                         return
                     account = selection.account
                     current_account_lease = selection.lease
-                    if selection.lease is not None:
-                        account_leases.append(selection.lease)
                     if (
                         not account
                         and require_security_work_authorized
@@ -2506,8 +2564,12 @@ class _StreamingRetryMixin:
                                 yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                                 return
                             transient_retries += 1
+                            overload_replacement_selected = await _select_overload_replacement(
+                                account, error_code, settlement
+                            )
                             if (
-                                transient_retries < _facade()._MAX_TRANSIENT_SAME_ACCOUNT_RETRIES
+                                not overload_replacement_selected
+                                and transient_retries < _facade()._MAX_TRANSIENT_SAME_ACCOUNT_RETRIES
                                 and proxy._remaining_budget_seconds(deadline) > 0
                                 and not settlement.downstream_visible
                             ):
@@ -2524,9 +2586,10 @@ class _StreamingRetryMixin:
                                 )
                                 await scheduler.sleep(delay)
                                 continue  # inner loop: retry same account
-                            # Exhausted same-account retries — penalize and failover
+                            # Retry exhaustion or an admitted overload replacement:
+                            # preserve the existing aggregate health/settlement path.
                             _facade().logger.warning(
-                                "Transient retries exhausted for account "
+                                "Leaving same-account transient retries "
                                 "request_id=%s account_id=%s retries=%s code=%s",
                                 request_id,
                                 account.id,

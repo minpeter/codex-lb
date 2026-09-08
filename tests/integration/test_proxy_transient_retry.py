@@ -1359,7 +1359,10 @@ async def test_stream_usage_limit_requests_immediate_refresh_so_pool_reports_exh
     account_id = await _import_account(async_client, raw_account_id, "usage-limit-refresh@example.com")
     reset_at = int(time.time()) + 1800
 
+    stream_calls: list[str | None] = []
+
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        stream_calls.append(account_id)
         raise ProxyResponseError(
             429,
             openai_error("usage_limit_reached", "usage limit reached"),
@@ -1370,6 +1373,18 @@ async def test_stream_usage_limit_requests_immediate_refresh_so_pool_reports_exh
     fetched: list[str | None] = []
     fetch_started = asyncio.Event()
     release_fetch = asyncio.Event()
+    refresh_finished = asyncio.Event()
+    refresh_tasks: list[asyncio.Task[None]] = []
+    real_run_requested_refresh = usage_updater_module._run_requested_refresh
+
+    async def observed_run_requested_refresh(requested_account_id: str) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        refresh_tasks.append(task)
+        await real_run_requested_refresh(requested_account_id)
+        # Observe the real refresh, including owned-session cleanup and its final
+        # invalidation; an unrelated generation bump cannot satisfy this signal.
+        refresh_finished.set()
 
     async def fake_fetch_usage(*, access_token, account_id, route=None, allow_direct_egress=True):
         fetched.append(account_id)
@@ -1393,6 +1408,7 @@ async def test_stream_usage_limit_requests_immediate_refresh_so_pool_reports_exh
     monkeypatch.setattr(proxy_module, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 1)
     monkeypatch.setattr(proxy_api_module, "_STREAM_STARTUP_ERROR_PROBE_SECONDS", 30.0)
     monkeypatch.setattr(usage_updater_module, "fetch_usage", fake_fetch_usage)
+    monkeypatch.setattr(usage_updater_module, "_run_requested_refresh", observed_run_requested_refresh)
     monkeypatch.setattr(usage_updater_module, "get_settings", lambda: refresh_settings)
 
     async def latest_primary_row():
@@ -1417,21 +1433,12 @@ async def test_stream_usage_limit_requests_immediate_refresh_so_pool_reports_exh
         stale_generation = selection_cache.generation
 
         release_fetch.set()
-        # The refresh is a tracked background task: poll briefly for its row instead of a
-        # scheduler tick (usage_refresh_interval_seconds).
-        latest = None
-        deadline = time.monotonic() + 5.0
-        while latest is None and time.monotonic() < deadline:
-            latest = await latest_primary_row()
-            if latest is None:
-                await asyncio.sleep(0.02)
+        await asyncio.wait_for(refresh_finished.wait(), timeout=5)
+        latest = await latest_primary_row()
         assert latest is not None, "a streamed usage_limit_reached must request an immediate usage refresh"
         assert latest.used_percent == 100.0
         assert latest.reset_at == reset_at
 
-        deadline = time.monotonic() + 5.0
-        while selection_cache.generation == stale_generation and time.monotonic() < deadline:
-            await asyncio.sleep(0.02)
         assert selection_cache.generation > stale_generation, "the written row must invalidate the selection cache"
         assert selection_cache._cache == {}
 
@@ -1445,6 +1452,7 @@ async def test_stream_usage_limit_requests_immediate_refresh_so_pool_reports_exh
         # failure with the row's reset time -- without waiting out the cache TTL.
         second = await async_client.post("/backend-api/codex/responses", json=payload)
         assert second.status_code == 429
+        assert stream_calls == [raw_account_id], "pool exhaustion must not dispatch a second upstream stream"
         error = second.json()["error"]
         assert error["code"] == "usage_limit_reached"
         assert error["type"] == "usage_limit_reached"
@@ -1452,8 +1460,15 @@ async def test_stream_usage_limit_requests_immediate_refresh_so_pool_reports_exh
         assert fetched == [raw_account_id], "the second selection failure must not fetch upstream again"
     finally:
         release_fetch.set()
-        usage_updater_module._clear_usage_refresh_state()
-        selection_cache.invalidate()
+        try:
+            if refresh_tasks:
+                await asyncio.wait_for(asyncio.gather(*refresh_tasks), timeout=5)
+        finally:
+            # Clearing the registry alone does not cancel its shielded work.
+            # Reclaim owned-session refreshes even if the completion wait failed.
+            await usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT.cancel_all()
+            usage_updater_module._clear_usage_refresh_state()
+            selection_cache.invalidate()
 
 
 # ===========================================================================

@@ -18,7 +18,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.core.balancer.types import UpstreamError
+from app.core.clients.proxy import ProxyResponseError
 from app.core.crypto import TokenEncryptor
+from app.core.errors import openai_error
 from app.core.openai.requests import ResponsesRequest
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
@@ -29,7 +31,7 @@ from app.modules.proxy import service as proxy_service
 from app.modules.proxy._service.streaming import retry as streaming_retry_module
 from app.modules.proxy._service.support import _TransientStreamError
 from app.modules.proxy.capability_lineage_repository import CapabilityLineageRepository
-from app.modules.proxy.load_balancer import AccountSelection
+from app.modules.proxy.load_balancer import AccountLease, AccountSelection
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.sticky_repository import StickySessionsRepository
 from app.modules.request_logs.repository import RequestLogsRepository
@@ -364,3 +366,332 @@ async def test_stream_once_api_key_heartbeat_is_scheduler_owned(monkeypatch: pyt
     await scheduler.drain()
     assert scheduler.owned_tasks == frozenset()
     assert await service.drain_persistence_tasks(timeout_seconds=1.0)
+
+
+async def _overload_retry_case(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    post_refresh: bool = False,
+    error_code: str = "server_is_overloaded",
+    http_error: bool = False,
+    guard: str | None = None,
+    no_sibling: bool = False,
+    keyed: bool = False,
+    hold_failed_release: bool = False,
+) -> SimpleNamespace:
+    settings = _make_proxy_settings()
+    if guard == "single_account":
+        settings.routing_strategy = "single_account"
+        settings.single_account_id = "overload-a"
+    service, clock, scheduler = _virtual_service(_RequestLogsRecorder())
+    account_a = _make_account("overload-a")
+    account_b = _make_account("overload-b")
+    attempts: list[str] = []
+    selections: list[dict[str, Any]] = []
+    leases: list[AccountLease] = []
+    released: list[AccountLease] = []
+    effects: list[str] = []
+    failed_release_entered = asyncio.Event()
+    failed_release_gate = asyncio.Event()
+    second_dispatch = asyncio.Event()
+    api_key = _make_api_key_data("overload-key") if keyed else None
+    reservation = (
+        ApiKeyUsageReservationData(reservation_id="overload-reservation", key_id=api_key.id, model="gpt-5.1")
+        if api_key is not None
+        else None
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 1 if guard == "attempt_limit" else 3)
+    monkeypatch.setattr(proxy_service, "_MAX_TRANSIENT_SAME_ACCOUNT_RETRIES", 3)
+    monkeypatch.setattr(streaming_retry_module, "backoff_seconds", lambda _attempt: 2.5)
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(side_effect=lambda account, **_k: account))
+    monkeypatch.setattr(service, "_write_request_log", AsyncMock())
+    monkeypatch.setattr(service, "_write_stream_preflight_error", AsyncMock())
+    monkeypatch.setattr(service, "_resolve_websocket_previous_response_owner", AsyncMock(return_value=account_a.id))
+    monkeypatch.setattr(service, "_resolve_compact_turn_state_owner", AsyncMock(return_value=account_a.id))
+    monkeypatch.setattr(service._load_balancer, "record_success", AsyncMock())
+    record_errors = AsyncMock()
+    monkeypatch.setattr(service._load_balancer, "record_errors", record_errors)
+
+    async def health(_account: Account, _error: UpstreamError, code: str, **_kwargs: Any) -> None:
+        # The initial 401's existing health path is outside this regression.
+        if code in {"server_is_overloaded", "overloaded_error"}:
+            effects.append("health")
+            if keyed:
+                assert "settle" in effects
+
+    async def settle(*_args: Any, **kwargs: Any) -> bool:
+        effects.append("settle")
+        if any(account_id == account_b.id for account_id in attempts) and keyed:
+            assert kwargs.get("wait_for_settlement") is True
+        return True
+
+    monkeypatch.setattr(service, "_handle_stream_error", health)
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle)
+    monkeypatch.setattr(service, "_release_unsettled_stream_api_key_usage", AsyncMock(return_value=True))
+    real_release = service._load_balancer.release_account_lease
+
+    async def release(lease: AccountLease | None) -> None:
+        if lease is None:
+            return
+        released.append(lease)
+        await real_release(lease)
+        if hold_failed_release and lease.account_id == account_a.id:
+            failed_release_entered.set()
+            await failed_release_gate.wait()
+
+    monkeypatch.setattr(service._load_balancer, "release_account_lease", release)
+
+    async def select(**kwargs: Any) -> AccountSelection:
+        # Keep both production selector layers: this replaces only the final
+        # pool boundary and uses real lease admission/release accounting.
+        selections.append(dict(kwargs))
+        excluded = set(kwargs.get("exclude_account_ids") or ())
+        required = kwargs.get("required_account_id")
+        candidates = [account_a] if no_sibling else [account_a, account_b]
+        for account in candidates:
+            if account.id in excluded or (required is not None and account.id != required):
+                continue
+            lease = await service._load_balancer.acquire_account_lease(
+                account.id,
+                kind=kwargs["lease_kind"],
+                estimated_tokens=kwargs["estimated_lease_tokens"],
+                concurrency_caps=kwargs["concurrency_caps"],
+                api_key_id=kwargs["api_key_id"],
+            )
+            if lease is not None:
+                leases.append(lease)
+                return AccountSelection(account=account, error_message=None, lease=lease)
+        return AccountSelection(account=None, error_message="No eligible sibling", error_code="no_accounts")
+
+    monkeypatch.setattr(service._load_balancer, "select_account", select)
+    payload_data: dict[str, Any] = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
+    headers: dict[str, str] = {}
+    if guard == "previous_response":
+        payload_data["previous_response_id"] = "resp_owner"
+    if guard == "account_payload":
+        payload_data["input"] = [{"type": "item_reference", "id": "item_owner"}]
+    if guard == "turn_state":
+        headers["x-codex-turn-state"] = "owner-turn-state"
+    payload = ResponsesRequest.model_validate(payload_data)
+
+    async def stream_once(account: Account, *_args: Any, **kwargs: Any) -> AsyncIterator[str]:
+        attempts.append(account.id)
+        if post_refresh and len(attempts) == 1:
+            raise ProxyResponseError(401, openai_error("invalid_api_key", "expired"))
+        overload_attempt = 2 if post_refresh else 1
+        if len(attempts) > overload_attempt:
+            second_dispatch.set()
+        if len(attempts) == overload_attempt or (hold_failed_release and account.id == account_a.id):
+            if guard == "budget":
+                # Budget expiry is an injected boundary, not a wall-clock race.
+                monkeypatch.setattr(service, "_remaining_budget_seconds", lambda _deadline: 0.0)
+            if guard == "visible":
+                kwargs["settlement"].downstream_visible = True
+                yield 'data: {"type":"response.output_text.delta","delta":"visible"}\n\n'
+            if guard == "terminal":
+                kwargs["settlement"].status = "error"
+                yield 'data: {"type":"response.failed","response":{"error":{"code":"server_is_overloaded"}}}\n\n'
+                raise proxy_service._TerminalStreamError(
+                    error_code, cast(UpstreamError, {"code": error_code, "message": "terminal"})
+                )
+            if http_error:
+                raise ProxyResponseError(500, openai_error(error_code, "upstream overloaded"))
+            raise _TransientStreamError(error_code, cast(UpstreamError, {"code": error_code, "message": "hiccup"}))
+        kwargs["settlement"].status = "success"
+        kwargs["settlement"].record_success = True
+        yield 'data: {"type":"response.completed","response":{"id":"resp_overload_ok"}}\n\n'
+
+    monkeypatch.setattr(service, "_stream_once", stream_once)
+
+    async def collect() -> list[str]:
+        return [
+            chunk
+            async for chunk in service._stream_with_retry(
+                payload,
+                headers,
+                codex_session_affinity=False,
+                openai_cache_affinity=False,
+                propagate_http_errors=False,
+                api_key=api_key,
+                api_key_reservation=reservation,
+                suppress_text_done_events=False,
+                request_transport="http",
+                upstream_stream_transport_override="http",
+                rewritten_file_account_id=account_a.id if guard == "file" else None,
+                file_account_resolution_complete=True,
+            )
+        ]
+
+    return SimpleNamespace(
+        service=service,
+        clock=clock,
+        scheduler=scheduler,
+        collect=collect,
+        attempts=attempts,
+        selections=selections,
+        leases=leases,
+        released=released,
+        effects=effects,
+        record_errors=record_errors,
+        second_dispatch=second_dispatch,
+        failed_release_entered=failed_release_entered,
+        failed_release_gate=failed_release_gate,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_refresh,http_error", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("error_code", ["server_is_overloaded", "overloaded_error"])
+async def test_overload_admits_sibling_before_same_account_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    post_refresh: bool,
+    http_error: bool,
+    error_code: str,
+) -> None:
+    case = await _overload_retry_case(
+        monkeypatch,
+        post_refresh=post_refresh,
+        http_error=http_error,
+        error_code=error_code,
+        keyed=True,
+    )
+    consumer = case.scheduler.create_task(case.collect())
+    try:
+        # Advance the known old backoff once so RED fails on actual attempts
+        # [A,A], not on a missing symbol or an unobserved scheduler deadline.
+        await case.scheduler.advance(2.5)
+        await asyncio.wait_for(case.second_dispatch.wait(), timeout=1.0)
+        chunks = await asyncio.wait_for(consumer, timeout=1.0)
+        expected = ["overload-a", "overload-b"]
+        if post_refresh:
+            expected.insert(0, "overload-a")
+        assert case.attempts == expected
+        assert json.loads(chunks[-1].split("data: ", 1)[1])["type"] == "response.completed"
+        assert len(case.selections) == 2  # retained admission, no third selection
+        initial, replacement = case.selections
+        assert set(initial["exclude_account_ids"]) == set()
+        assert set(replacement["exclude_account_ids"]) == {"overload-a"}
+        for key in (
+            "model",
+            "service_tier",
+            "account_ids",
+            "require_security_work_authorized",
+            "lease_kind",
+            "estimated_lease_tokens",
+            "concurrency_caps",
+            "api_key_id",
+            "sticky_key",
+            "sticky_kind",
+            "sticky_source",
+            "reallocate_sticky",
+            "routing_strategy",
+        ):
+            assert initial[key] == replacement[key]
+        assert case.effects == ["settle", "health"]
+        case.record_errors.assert_not_awaited()
+        assert case.released == case.leases
+        assert await case.service._load_balancer.account_pressure_snapshot("overload-a") == (0, 0, 0.0)
+        assert await case.service._load_balancer.account_pressure_snapshot("overload-b") == (0, 0, 0.0)
+    finally:
+        await case.scheduler.cancel_owned_tasks()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_refresh", [False, True])
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "no_sibling",
+        "generic",
+        "file",
+        "turn_state",
+        "previous_response",
+        "account_payload",
+        "single_account",
+        "attempt_limit",
+    ],
+)
+async def test_overload_preserves_same_account_fallback_and_owner_guards(
+    monkeypatch: pytest.MonkeyPatch,
+    post_refresh: bool,
+    guard: str,
+) -> None:
+    case = await _overload_retry_case(
+        monkeypatch,
+        post_refresh=post_refresh,
+        guard=guard,
+        no_sibling=guard == "no_sibling",
+        error_code="server_error" if guard == "generic" else "server_is_overloaded",
+    )
+    consumer = case.scheduler.create_task(case.collect())
+    try:
+        await case.scheduler.drain()
+        assert not case.second_dispatch.is_set()
+        assert case.scheduler.pending_timers == 1
+        await case.scheduler.advance(2.5)
+        await asyncio.wait_for(case.second_dispatch.wait(), timeout=1.0)
+        chunks = await asyncio.wait_for(consumer, timeout=1.0)
+        assert case.attempts == ["overload-a"] * (3 if post_refresh else 2)
+        assert json.loads(chunks[-1].split("data: ", 1)[1])["type"] == "response.completed"
+        assert len(case.selections) == (2 if guard == "no_sibling" else 1)
+        assert case.released == case.leases
+        case.record_errors.assert_not_awaited()
+    finally:
+        await case.scheduler.cancel_owned_tasks()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_refresh", [False, True])
+@pytest.mark.parametrize("guard", ["visible", "terminal", "budget"])
+async def test_overload_does_not_expand_replay_or_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    post_refresh: bool,
+    guard: str,
+) -> None:
+    case = await _overload_retry_case(monkeypatch, post_refresh=post_refresh, guard=guard)
+    consumer = case.scheduler.create_task(case.collect())
+    try:
+        chunks = await asyncio.wait_for(consumer, timeout=1.0)
+        assert case.attempts == ["overload-a"] * (2 if post_refresh else 1)
+        assert len(case.selections) == 1
+        assert not case.second_dispatch.is_set()
+        assert any(json.loads(chunk.split("data: ", 1)[1])["type"] == "response.failed" for chunk in chunks)
+        assert case.released == case.leases
+    finally:
+        await case.scheduler.cancel_owned_tasks()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("post_refresh", [False, True])
+async def test_overload_retained_admission_is_released_if_cancelled_before_consumption(
+    monkeypatch: pytest.MonkeyPatch,
+    post_refresh: bool,
+) -> None:
+    case = await _overload_retry_case(
+        monkeypatch,
+        post_refresh=post_refresh,
+        keyed=True,
+        hold_failed_release=True,
+    )
+    # The release signal is installed before the request can admit a sibling.
+    consumer = case.scheduler.create_task(case.collect())
+    try:
+        await case.scheduler.advance(5.0)
+        await asyncio.wait_for(case.failed_release_entered.wait(), timeout=1.0)
+        assert [lease.account_id for lease in case.leases] == ["overload-a", "overload-b"]
+        assert "overload-b" not in case.attempts
+        assert (await case.service._load_balancer.account_pressure_snapshot("overload-b"))[1] == 1
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(consumer, timeout=1.0)
+        await case.scheduler.drain()
+        assert await case.service.drain_persistence_tasks(timeout_seconds=1.0)
+        assert case.released == case.leases
+        assert await case.service._load_balancer.account_pressure_snapshot("overload-b") == (0, 0, 0.0)
+        assert case.effects == ["settle", "health"]
+        case.record_errors.assert_not_awaited()
+    finally:
+        case.failed_release_gate.set()
+        await case.scheduler.cancel_owned_tasks()

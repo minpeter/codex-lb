@@ -264,16 +264,15 @@ async def test_select_account_skips_backed_off_account_while_a_healthy_sibling_e
     )
     balancer._runtime[hot.id] = RuntimeState(overload_backoff_until=clock.time() + OVERLOAD_BACKOFF_BASE_SECONDS)
 
-    # Equal weights: 40 draws all landing on ``clean`` is 2**-40 by chance.
-    for _ in range(40):
-        result = await balancer.select_account()
-        assert result.account is not None
-        assert result.account.id == clean.id
+    result = await balancer.select_account(routing_strategy="round_robin")
+    assert result.account is not None
+    assert result.account.id == clean.id
 
     clock.advance(OVERLOAD_BACKOFF_BASE_SECONDS + 1.0)
     selected: set[str] = set()
-    for _ in range(40):
-        result = await balancer.select_account()
+    for _ in range(2):
+        clock.advance(1.0)
+        result = await balancer.select_account(routing_strategy="round_robin")
         assert result.account is not None
         selected.add(result.account.id)
     assert hot.id in selected
@@ -329,22 +328,21 @@ async def _select_sticky(balancer: LoadBalancer, states: list[AccountState], rep
 
 
 @pytest.mark.asyncio
-async def test_fresh_sticky_binding_avoids_backed_off_account_but_established_owner_is_kept() -> None:
+async def test_fresh_and_established_soft_bindings_avoid_backed_off_account() -> None:
     clock = VirtualClock(epoch_value=2_000_000_000.0)
     balancer = LoadBalancer(_mock_repo_factory, clock=clock)
     balancer._runtime["hot"] = RuntimeState(overload_backoff_until=clock.time() + OVERLOAD_BACKOFF_BASE_SECONDS)
     states = [_state("hot"), _state("clean")]
 
     # A previously unseen key is a fresh upstream admission: bind away from the overloaded account.
-    for _ in range(40):
-        fresh = await _select_sticky(balancer, [_state("hot"), _state("clean")], _sticky_repo(None))
-        assert fresh.account is not None
-        assert fresh.account.account_id == "clean"
+    fresh = await _select_sticky(balancer, [_state("hot"), _state("clean")], _sticky_repo(None))
+    assert fresh.account is not None
+    assert fresh.account.account_id == "clean"
 
-    # An established owner is warm-session reuse: the overload window never touches it.
+    # Soft affinity is a preference for this new admission, not hard ownership.
     owned = await _select_sticky(balancer, states, _sticky_repo("hot"))
     assert owned.account is not None
-    assert owned.account.account_id == "hot"
+    assert owned.account.account_id == "clean"
 
     # With no overload-free alternative the fresh binding still lands on the backed-off account.
     alone = await _select_sticky(balancer, [_state("hot")], _sticky_repo(None))
@@ -386,8 +384,9 @@ async def test_fresh_sticky_binding_reports_the_pool_it_selected_from() -> None:
     assert unfiltered.effective_states is None
 
     owned = await _outcome([hot, clean], "hot")
-    assert owned.selection.account is not None and owned.selection.account.account_id == "hot"
-    assert owned.effective_states is None
+    assert owned.selection.account is not None and owned.selection.account.account_id == "clean"
+    assert owned.effective_states is not None
+    assert [state.account_id for state in owned.effective_states] == ["clean"]
 
 
 # --- isolation stage -------------------------------------------------------
@@ -485,11 +484,12 @@ def _isolated_runtime(now: float, *, seconds: float = 1800.0) -> RuntimeState:
     )
 
 
-def test_sticky_owner_reroute_pool_requires_isolation_and_an_overload_free_sibling() -> None:
+def test_sticky_owner_reroute_pool_requires_backoff_and_an_overload_free_sibling() -> None:
     now = 1000.0
     states = [_state("hot"), _state("clean")]
     soft = {"hot": RuntimeState(overload_backoff_until=now + 60.0)}
-    assert sticky_owner_isolation_reroute_pool(states, soft, owner_account_id="hot", now=now) is None
+    soft_pool = sticky_owner_isolation_reroute_pool(states, soft, owner_account_id="hot", now=now)
+    assert soft_pool is not None and [state.account_id for state in soft_pool] == ["clean"]
     isolated = {"hot": _isolated_runtime(now)}
     pool = sticky_owner_isolation_reroute_pool(states, isolated, owner_account_id="hot", now=now)
     assert pool is not None and [state.account_id for state in pool] == ["clean"]
@@ -547,17 +547,27 @@ async def test_isolated_soft_sticky_owner_is_rerouted_and_rebound(kind: StickySe
 
 
 @pytest.mark.asyncio
-async def test_soft_backoff_below_isolation_keeps_the_established_owner() -> None:
+@pytest.mark.parametrize("level", [1, 2])
+@pytest.mark.parametrize(
+    "kind", [StickySessionKind.PROMPT_CACHE, StickySessionKind.STICKY_THREAD, StickySessionKind.CODEX_SESSION]
+)
+async def test_soft_backoff_rebinds_the_established_owner_to_eligible_sibling(
+    level: int, kind: StickySessionKind
+) -> None:
     clock = VirtualClock(epoch_value=2_000_000_000.0)
     balancer = LoadBalancer(_mock_repo_factory, clock=clock)
     balancer._runtime["hot"] = RuntimeState(
         overload_backoff_until=clock.time() + OVERLOAD_BACKOFF_MAX_SECONDS,
-        overload_backoff_level=OVERLOAD_ISOLATION_TRIP_LEVEL - 1,
+        overload_backoff_level=level,
     )
-    outcome = await _select_sticky_outcome(balancer, [_state("hot"), _state("clean")], _sticky_repo("hot"))
+    outcome = await _select_sticky_outcome(
+        balancer, [_state("hot"), _state("clean")], _sticky_repo("hot"), kind=kind
+    )
     assert outcome.selection.account is not None
-    assert outcome.selection.account.account_id == "hot"
-    assert outcome.mutation is None or outcome.mutation.account_id in (None, "hot")
+    assert outcome.selection.account.account_id == "clean"
+    assert outcome.mutation is not None and outcome.mutation.account_id == "clean"
+    assert outcome.effective_states is not None
+    assert [state.account_id for state in outcome.effective_states] == ["clean"]
 
 
 @pytest.mark.asyncio

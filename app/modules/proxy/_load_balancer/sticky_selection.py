@@ -30,7 +30,6 @@ from app.modules.accounts.repository import AccountsRepository
 from app.modules.proxy._load_balancer.overload_backoff import (
     filter_overload_backoff_candidates,
     overload_backoff_active,
-    overload_isolation_active,
     sticky_owner_isolation_reroute_pool,
 )
 from app.modules.proxy._load_balancer.types import (
@@ -509,9 +508,8 @@ async def run_sticky_selection_path(
                 threshold_pct=fair_share_threshold_pct,
                 redact_sensitive_details=redact_sensitive_details,
             )
-            # An isolated soft owner may be released to a sibling by the
-            # overload isolation stage (see ``_run_select_with_stickiness``).
-            owner_overload_isolated = isinstance(sticky_existing_account_id, str) and overload_isolation_active(
+            # A backed-off soft owner may move to an eligible sibling.
+            owner_overload_backed_off = isinstance(sticky_existing_account_id, str) and overload_backoff_active(
                 owner._runtime.get(sticky_existing_account_id), owner._clock.time()
             )
             if hard_sticky:
@@ -526,7 +524,7 @@ async def run_sticky_selection_path(
                 # soft hint; the authoritative preferred-owner path
                 # normally bypasses it.
                 selection_states = states
-                if owner_overload_isolated:
+                if owner_overload_backed_off:
                     # The owner keeps its cap exemption, but a sibling it
                     # may be released to must pass the caps: otherwise the
                     # reroute could pick a saturated sibling that lease
@@ -566,8 +564,8 @@ async def run_sticky_selection_path(
                 selection_states = response_create_states or selection_states
             # Cap spillover is request-local (the mapping is preserved so the
             # session returns to its owner once the cap clears) -- unless the
-            # owner is also isolated for overload, in which case the fallback
-            # is rebound like any isolation reroute instead of bouncing the
+            # owner is also backed off for overload, in which case the fallback
+            # is rebound like any overload reroute instead of bouncing the
             # session across siblings turn after turn.
             preserve_existing_mapping = (
                 bare_session_key
@@ -575,7 +573,7 @@ async def run_sticky_selection_path(
                 and (
                     (
                         cap_spillover_allowed
-                        and not owner_overload_isolated
+                        and not owner_overload_backed_off
                         and any(state.account_id == sticky_existing_account_id for state in states)
                         and not any(state.account_id == sticky_existing_account_id for state in selection_states)
                     )
@@ -1410,12 +1408,12 @@ async def _select_with_stickiness(
                     )
                     burn_first_reallocate = burn_first.account is not None
 
-            # Isolation stage of the overload backoff: the pinned owner is a
+            # Active overload backoff: the pinned owner is a
             # *soft* mapping (hard continuity owners never reach this path)
             # and every request re-entering it is a fresh admission upstream
             # keeps rejecting, so release it while the strategy can still pick
-            # an overload-free sibling. Soft backoff levels below isolation
-            # keep the owner, so a short burst never churns warm sessions.
+            # an overload-free sibling. A single rejection still keeps the
+            # owner because it does not trip the overload window.
             if sticky_kind in (
                 StickySessionKind.PROMPT_CACHE,
                 StickySessionKind.STICKY_THREAD,
@@ -1442,7 +1440,7 @@ async def _select_with_stickiness(
                     # must not expose them. The isolation-engaged warning
                     # already names the account under the redaction policy.
                     logger.info(
-                        "sticky_owner_overload_isolation_reroute sticky_kind=%s overload_free_candidates=%d",
+                        "sticky_owner_overload_reroute sticky_kind=%s overload_free_candidates=%d",
                         sticky_kind.value,
                         len(overload_reroute_pool),
                     )

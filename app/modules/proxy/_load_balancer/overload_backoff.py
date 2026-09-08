@@ -17,13 +17,11 @@ path cannot express:
 This module keeps a replica-local sliding window of overload rejections per
 account with two escalation stages:
 
-1. **Soft backoff** (every trip): fresh (unbound) selection and fresh sticky
-   bindings *deprioritize* the account for a bounded, exponentially growing
-   interval. Established sticky owners are left alone, so a short burst never
-   churns warm sessions.
+1. **Soft backoff** (every trip): fresh selection and soft sticky admissions
+   prefer eligible overload-free siblings for a bounded, exponentially growing
+   interval. A lone rejection does not trip the window or move an owner.
 2. **Isolation** (the configured trip level, sustained overload): the account
-   is held out for a longer, operator-configured interval and established
-   *soft* sticky owners are rerouted as well. Only a soft sticky mapping is a
+   is held out for a longer, operator-configured interval. Only a soft sticky mapping is a
    locality hint; every request that re-enters the pinned account is a fresh
    upstream admission, so keeping the owner pinned just replays the rejection
    wait per request. Hard continuity owners (``previous_response_id``, bridge
@@ -235,14 +233,14 @@ def sticky_owner_isolation_reroute_pool(
     """Return the overload-free pool a *soft* sticky owner should be rerouted
     into, or ``None`` when the owner keeps its session.
 
-    The owner is released only while it is in the isolation stage (not on a
-    soft backoff) and the pool still holds another candidate outside the
+    The owner is released while it is in active overload backoff and the
+    pool still holds another candidate outside the
     overload window; the caller must verify the strategy actually selects
     from the returned pool before abandoning the owner.
     """
     if runtime_by_account_id is None:
         return None
-    if not overload_isolation_active(runtime_by_account_id.get(owner_account_id), now):
+    if not overload_backoff_active(runtime_by_account_id.get(owner_account_id), now):
         return None
     pool = filter_overload_backoff_candidates(states, runtime_by_account_id, now=now)
     if pool is states:

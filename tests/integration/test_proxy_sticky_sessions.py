@@ -684,6 +684,7 @@ async def test_codex_goal_restart_cannot_retire_owner_outside_api_key_scope(
     from sqlalchemy import select
 
     from app.db.models import StickySession
+    from app.modules.proxy._service.streaming import retry as streaming_retry_module
     from app.modules.proxy.sticky_repository import StickySessionsRepository
 
     settings_response = await async_client.put(
@@ -743,6 +744,9 @@ async def test_codex_goal_restart_cannot_retire_owner_outside_api_key_scope(
         if False:
             yield ""
 
+    # Exercise real scope/ownership selection without racing its terminal error
+    # against the unrelated capacity-recovery request deadline.
+    monkeypatch.setattr(streaming_retry_module, "_account_selection_recovery_sleep_seconds", lambda _selection: None)
     monkeypatch.setattr(proxy_module, "core_stream_responses", fail_stream)
     response = await async_client.post(
         "/backend-api/codex/responses",
