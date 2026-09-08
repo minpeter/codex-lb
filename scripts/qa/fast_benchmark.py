@@ -190,6 +190,7 @@ class ParsedResponse:
     usage: Usage = field(default_factory=Usage)
     event_tiers: list[EventTier] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    measurement_qualifications: list[str] = field(default_factory=list)
     visible_delta_count: int = 0
 
     def error(self, code: str) -> None:
@@ -280,12 +281,22 @@ class SSEParser:
         except (json.JSONDecodeError, RecursionError):
             self.response.error("invalid_sse_json")
             return
-        if not isinstance(obj, dict) or not isinstance(obj.get("type"), str):
+        if not isinstance(obj, dict):
             self.response.error("invalid_event_shape")
             return
-        event = obj["type"]
+        event = obj.get("type")
+        if not isinstance(event, str):
+            event = "error" if isinstance(obj.get("error"), dict) else ""
+        if not event:
+            self.response.error("invalid_event_shape")
+            return
         response = obj.get("response")
         envelope = response if isinstance(response, dict) else {}
+        error = obj.get("error")
+        if not isinstance(error, dict):
+            error = envelope.get("error")
+        if event == "error" and not isinstance(error, dict) and "code" in obj:
+            error = obj
         tier = envelope.get("service_tier", obj.get("service_tier"))
         safe_tier = tier if isinstance(tier, str) and tier in TIERS else None
         if tier is not None and safe_tier is None:
@@ -318,7 +329,6 @@ class SSEParser:
         self.response.usage = parse_usage(envelope.get("usage"))
         if event != "response.completed":
             self.response.error(event.replace(".", "_"))
-            error = obj if event == "error" else envelope.get("error")
             if not isinstance(error, dict):
                 error = envelope.get("incomplete_details")
             code = error.get("code", error.get("reason")) if isinstance(error, dict) else None
@@ -339,7 +349,7 @@ class SSEParser:
             self.response.error("missing_response_terminal")
         for name, value in asdict(self.response.usage).items():
             if value is None:
-                self.response.error(f"missing_terminal_{name}")
+                self.response.measurement_qualifications.append(f"missing_terminal_{name}")
         return self.response
 
 
@@ -689,6 +699,7 @@ async def request(
         "terminal_type": parsed.terminal_type,
         "terminal_error_code": parsed.terminal_error_code,
         "errors": errors,
+        "measurement_qualifications": parsed.measurement_qualifications,
         "visible_delta_count": parsed.visible_delta_count,
         "event_tiers": [{**asdict(event), "timestamp": event.timestamp - started} for event in parsed.event_tiers],
     }

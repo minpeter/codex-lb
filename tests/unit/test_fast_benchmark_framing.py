@@ -110,7 +110,7 @@ def test_chat_missing_usage_is_nullable() -> None:
     parser.feed(chat_frame(choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}]) + b"data: [DONE]\n\n", 1.0)
     result = parser.finish()
     assert result.usage == Usage()
-    assert "missing_terminal_reasoning_tokens" in result.errors
+    assert "missing_terminal_reasoning_tokens" in result.measurement_qualifications
 
 
 def test_chat_consumes_actual_b_serialization() -> None:

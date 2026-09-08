@@ -1,0 +1,4 @@
+- [x] Reproduce and fix HTTP hint omission for missing and legacy account IDs.
+- [x] Reproduce and fix optional accounting omissions counted as request errors.
+- [x] Reproduce and fix nested Responses error-code classification.
+- [x] Verify focused regressions, real local surfaces, types and specifications.

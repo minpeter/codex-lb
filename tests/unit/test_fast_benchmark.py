@@ -162,11 +162,71 @@ def test_invalid_json_shapes_are_reported_without_echo(raw: bytes) -> None:
     assert "secret" not in json.dumps(asdict(result))
 
 
+def test_completed_response_missing_optional_accounting_is_successful() -> None:
+    parser = SSEParser()
+    parser.feed(event("response.output_text.delta", delta="visible"), 0.0)
+    parser.feed(
+        event(
+            "response.completed",
+            response={
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 500,
+                    "output_tokens_details": {"reasoning_tokens": 100},
+                }
+            },
+        ),
+        1.0,
+    )
+    result = parser.finish()
+    assert result.errors == []
+    assert result.measurement_qualifications == ["missing_terminal_cached_tokens"]
+    measured = metrics(result, 0.0, 2.0)
+    assert measured["e2e_seconds"] == 2.0
+    assert measured["ttfo_seconds"] == 0.0
+    assert measured["visible_tokens_per_e2e_second"] == 200.0
+    assert measured["total_output_tokens_per_terminal_second"] == 500.0
+
+
+def test_missing_required_tps_accounting_is_qualified_not_failed() -> None:
+    parser = SSEParser()
+    parser.feed(event("response.output_text.delta", delta="visible"), 0.0)
+    parser.feed(event("response.completed", response={"usage": {"input_tokens": 100}}), 1.0)
+    result = parser.finish()
+    assert result.errors == []
+    assert "missing_terminal_output_tokens" in result.measurement_qualifications
+    measured = metrics(result, 0.0, 2.0)
+    assert measured["e2e_seconds"] == 2.0
+    assert measured["visible_tokens_per_e2e_second"] is None
+    assert measured["visible_tokens"] is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "error", "error": {"code": "server_is_overloaded", "message": "secret"}},
+        {"error": {"code": "server_is_overloaded", "message": "secret"}},
+        {
+            "type": "error",
+            "response": {"error": {"code": "server_is_overloaded", "message": "secret"}},
+        },
+    ],
+)
+def test_responses_error_code_is_preserved_from_supported_envelopes(payload: dict[str, object]) -> None:
+    parser = SSEParser()
+    parser.feed(b"data: " + json.dumps(payload).encode() + b"\n\n", 1.0)
+    result = parser.finish()
+    assert result.terminal_type == "error"
+    assert result.terminal_error_code == "server_is_overloaded"
+    assert "error" in result.errors
+    assert "secret" not in json.dumps(asdict(result))
+
+
 def test_missing_usage_unknown_reasoning_and_unterminated_event() -> None:
     parser = SSEParser()
     parser.feed(event("response.completed", response={}), 1.0)
     result = parser.finish()
-    assert "missing_terminal_output_tokens" in result.errors
+    assert "missing_terminal_output_tokens" in result.measurement_qualifications
     assert metrics(result, 0.0, 2.0)["visible_tokens"] is None
     parser = SSEParser()
     parser.feed(terminal().rstrip(b"\r\n"), 1.0)
