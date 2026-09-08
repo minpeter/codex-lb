@@ -1,0 +1,7 @@
+- [ ] Capture real behavioral RED for missing-tier and fallback headers.
+- [ ] Capture direct WebSocket routing propagation RED and implement repair.
+- [ ] Verify buffered SSE metrics and distinct control-arm configuration.
+- [ ] Run transport, remote credential and static regressions.
+- [ ] Commit, push and deploy B only; capture actual wire and live response proof.
+- [ ] Compare Astra, Luna and Terra using temporary non-enforcing scoped keys.
+- [ ] Remove temporary keys and QA resources; report measured results and limits.

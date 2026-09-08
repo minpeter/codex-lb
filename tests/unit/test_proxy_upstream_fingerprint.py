@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from app.core.clients import proxy as proxy_module
 from app.core.clients.proxy import (
     _build_upstream_headers,
@@ -13,6 +15,15 @@ from app.core.clients.proxy import (
 
 def _lower_keys(headers: dict[str, str]) -> set[str]:
     return {key.lower() for key in headers}
+
+
+@pytest.mark.parametrize("builder", [_build_upstream_headers, _build_upstream_websocket_headers])
+def test_absent_effective_tier_uses_official_model_only_hint(builder):
+    headers = builder(
+        {"X-Codex-Routing-Hint": "model=untrusted;tier=priority"},
+        "fixture-access", "fixture-account", routing_hint=("gpt-6-astra", None),
+    )
+    assert headers["x-codex-routing-hint"] == "model=gpt-6-astra"
 
 
 def test_build_codex_user_agent_matches_codex_cli_format():

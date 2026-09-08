@@ -1000,7 +1000,9 @@ def _build_upstream_headers(
         )
     if routing_hint is not None:
         model, service_tier = routing_hint
-        headers[CODEX_ROUTING_HINT_HEADER] = f"model={model};tier={service_tier or 'default'}"
+        headers[CODEX_ROUTING_HINT_HEADER] = f"model={model}" + (
+            f";tier={service_tier}" if service_tier is not None else ""
+        )
     return headers
 
 
@@ -1070,7 +1072,9 @@ def _build_upstream_websocket_headers(
             headers[_CHATGPT_ACCOUNT_ID_HEADER] = account_id
     if routing_hint is not None:
         model, service_tier = routing_hint
-        headers[CODEX_ROUTING_HINT_HEADER] = f"model={model};tier={service_tier or 'default'}"
+        headers[CODEX_ROUTING_HINT_HEADER] = f"model={model}" + (
+            f";tier={service_tier}" if service_tier is not None else ""
+        )
     return headers
 
 
@@ -4136,7 +4140,10 @@ async def _stream_responses_with_session(
         transport = "http"
         payload_dict = http_payload_dict
         payload_json = json.dumps(payload_dict, ensure_ascii=True, separators=(",", ":"))
-        upstream_headers = _build_upstream_headers(headers, access_token, account_id)
+        upstream_headers = _build_upstream_headers(
+            headers, access_token, account_id,
+            routing_hint=(payload.model, payload.service_tier) if synthesize_routing_hint else None,
+        )
         _apply_responses_lite_http_header(
             upstream_headers,
             payload_dict,
