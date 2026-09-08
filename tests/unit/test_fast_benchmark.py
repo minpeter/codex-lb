@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -8,30 +11,33 @@ from unittest.mock import AsyncMock, MagicMock
 import aiohttp
 import pytest
 
+from app.core.openai.chat_requests import ChatCompletionsRequest
+from app.core.openai.requests import ResponsesRequest
 from scripts.qa.fast_benchmark import (
     METRICS,
     MODELS,
+    PROMPT,
     Config,
     ParsedResponse,
     SSEParser,
+    Surface,
     Trial,
     Usage,
     bootstrap_interval,
     load_config,
+    main,
     metrics,
     request,
     request_payload,
+    run,
     schedule,
     summarize,
+    surface_url,
 )
 
 
 def event(kind: str, **values: object) -> bytes:
-    return (
-        b"data: "
-        + json.dumps({"type": kind, **values}, ensure_ascii=False).encode()
-        + b"\r\n\r\n"
-    )
+    return b"data: " + json.dumps({"type": kind, **values}, ensure_ascii=False).encode() + b"\r\n\r\n"
 
 
 def usage() -> dict[str, object]:
@@ -128,11 +134,7 @@ def test_failure_terminals_are_failures_and_never_leak_messages(kind: str) -> No
         "code": "server_error",
         "message": "secret response text https://secret.invalid",
     }
-    data = (
-        event(kind, **details)
-        if kind == "error"
-        else event(kind, response={"error": details, "usage": usage()})
-    )
+    data = event(kind, **details) if kind == "error" else event(kind, response={"error": details, "usage": usage()})
     parser.feed(data, 2.0)
     result = parser.finish()
     assert result.terminal_type == kind
@@ -151,9 +153,7 @@ def test_non_responses_terminals_do_not_succeed(data: bytes) -> None:
     assert "missing_response_terminal" in result.errors
 
 
-@pytest.mark.parametrize(
-    "raw", [b"[]", b"null", b"123", b'{"type":[]}', b'"secret"', b"{invalid"]
-)
+@pytest.mark.parametrize("raw", [b"[]", b"null", b"123", b'{"type":[]}', b'"secret"', b"{invalid"])
 def test_invalid_json_shapes_are_reported_without_echo(raw: bytes) -> None:
     parser = SSEParser()
     parser.feed(b"data: " + raw + b"\n\n", 0.0)
@@ -201,9 +201,7 @@ def test_metrics_exact_formulas_and_distinct_denominators() -> None:
 
 @pytest.mark.parametrize("span", [0.0, -1.0])
 def test_invalid_span_is_null_with_reason(span: float) -> None:
-    parsed = ParsedResponse(
-        first_text_timestamp=0.0, last_text_timestamp=span, usage=Usage(1, 20, 0, 0)
-    )
+    parsed = ParsedResponse(first_text_timestamp=0.0, last_text_timestamp=span, usage=Usage(1, 20, 0, 0))
     result = metrics(parsed, 0.0, 2.0)
     assert result["ttfo_seconds"] == 0.0
     assert result["approx_visible_tokens_per_output_second"] is None
@@ -222,9 +220,7 @@ def test_balanced_reproducible_adjacent_pairs_per_model() -> None:
         assert first.pair_id == second.pair_id
         assert first.fast is not second.fast
     for model in MODELS:
-        starts = [
-            rows[i].fast for i in range(0, len(rows), 2) if rows[i].model == model
-        ]
+        starts = [rows[i].fast for i in range(0, len(rows), 2) if rows[i].model == model]
         assert sum(starts) == 3
         assert all(a != b for a, b in zip(starts, starts[1:]))
     assert len({row.pair_id for row in rows}) == 18
@@ -259,22 +255,14 @@ def test_repeats_are_not_discarded_and_intervals_are_per_model() -> None:
     for model_index, model in enumerate(MODELS):
         data = result["per_model"][model]
         assert data["standard"]["metrics"]["e2e_seconds"]["median"] == 25.0
-        assert (
-            data["standard"]["metrics"]["visible_tokens_per_e2e_second"]["median"]
-            == 25.0
-        )
+        assert data["standard"]["metrics"]["visible_tokens_per_e2e_second"]["median"] == 25.0
         paired = data["paired"]["e2e_seconds"]
         assert paired["n"] == 4
         assert paired["priority_wins"] == 4
         assert len({d["pair_id"] for d in paired["deltas"]}) == 4
         assert paired["mean_delta_bootstrap_95pct"] == [-model_index - 1.0] * 2
     rows[1]["errors"] = ["response_failed"]
-    assert (
-        summarize(rows, 19)["per_model"][MODELS[0]]["paired"]["e2e_seconds"][
-            "excluded_pairs"
-        ]
-        == 1
-    )
+    assert summarize(rows, 19)["per_model"][MODELS[0]]["paired"]["e2e_seconds"]["excluded_pairs"] == 1
 
 
 def test_bootstrap_nonconstant_seeded_and_small_sample_undefined() -> None:
@@ -299,6 +287,58 @@ def test_payload_standard_omits_tier_and_effort_is_model_specific() -> None:
     payload = request_payload(cfg, Trial(0, "p", MODELS[1], True))
     assert payload["service_tier"] == "priority"
     assert payload["reasoning"] == {"effort": "minimal"}
+
+
+def test_chat_payload_uses_b_schema() -> None:
+    payload = request_payload(config(), Trial(0, "p", MODELS[0], False), "chat")
+    assert payload.get("messages") == [{"role": "user", "content": PROMPT}]
+    assert payload.get("reasoning_effort") == "low"
+    assert payload.get("max_completion_tokens") == 1600
+    assert payload.get("stream_options") == {"include_usage": True}
+    assert "input" not in payload
+
+
+@pytest.mark.parametrize("surface", ["responses", "chat", "codex"])
+@pytest.mark.parametrize("model", MODELS)
+def test_surface_payloads_match_arms_and_b_schema(surface: Surface, model: str) -> None:
+    cfg = config()
+    cfg.reasoning_effort[model] = "minimal"
+    standard = request_payload(cfg, Trial(0, "p", model, False), surface)
+    priority = request_payload(cfg, Trial(0, "p", model, True), surface)
+    assert priority == {**standard, "service_tier": "priority"}
+    assert "service_tier" not in standard
+    assert standard["store"] is False
+    if surface == "chat":
+        schema = ChatCompletionsRequest.model_validate(standard)
+        assert schema.max_completion_tokens == 1600
+        assert schema.stream_options and schema.stream_options.include_usage
+        normalized = schema.to_responses_request()
+    else:
+        normalized = ResponsesRequest.model_validate({"instructions": "", **standard})
+        assert standard["max_output_tokens"] == 1600
+    assert normalized.reasoning and normalized.reasoning.effort == "minimal"
+    assert normalized.instructions == ""
+    assert normalized.input == [{"role": "user", "content": [{"type": "input_text", "text": PROMPT}]}]
+    assert normalized.model == model
+
+
+@pytest.mark.parametrize("base", ["https://b.invalid/v1", "http://b.invalid:8080/v1"])
+def test_surface_urls_stay_on_b(base: str) -> None:
+    cfg = Config(base, config().keys, config().reasoning_effort)
+    assert surface_url(cfg, "responses") == base + "/responses"
+    assert surface_url(cfg, "chat") == base + "/chat/completions"
+    assert surface_url(cfg, "codex") == base.removesuffix("/v1") + "/backend-api/codex/responses"
+
+
+def test_default_payload_is_unchanged() -> None:
+    assert request_payload(config(), Trial(0, "p", MODELS[0], False)) == {
+        "model": MODELS[0],
+        "input": PROMPT,
+        "stream": True,
+        "store": False,
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 1600,
+    }
 
 
 def test_protected_config_attestations(tmp_path: Path) -> None:
@@ -342,9 +382,7 @@ async def test_request_drains_to_terminal_closes_context_and_reports_metrics(
         raise AssertionError("must stop after Responses terminal, not wait for EOF")
 
     ticks = iter([10.0, 11.0, 12.0, 16.0, 18.0, 20.0])
-    monkeypatch.setattr(
-        "scripts.qa.fast_benchmark.time", MagicMock(monotonic=lambda: next(ticks))
-    )
+    monkeypatch.setattr("scripts.qa.fast_benchmark.time", MagicMock(monotonic=lambda: next(ticks)))
     response = MagicMock(
         status=200,
         content_type="text/event-stream",
@@ -370,16 +408,12 @@ async def test_request_drains_to_terminal_closes_context_and_reports_metrics(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure", [aiohttp.ClientConnectionError, TimeoutError, OSError]
-)
+@pytest.mark.parametrize("failure", [aiohttp.ClientConnectionError, TimeoutError, OSError])
 async def test_transport_errors_are_sanitized_and_context_closed(
     failure: type[Exception],
 ) -> None:
     context = AsyncMock()
-    context.__aenter__.side_effect = failure(
-        "dummy-test-key https://private.invalid/user-content"
-    )
+    context.__aenter__.side_effect = failure("dummy-test-key https://private.invalid/user-content")
     session = MagicMock(spec=aiohttp.ClientSession)
     session.post.return_value = context
     result = await request(session, config(), Trial(0, "p", MODELS[0], True), 5.0)
@@ -388,3 +422,156 @@ async def test_transport_errors_are_sanitized_and_context_closed(
     assert "private.invalid" not in json.dumps(result)
     # __aenter__ failed, so Python does not invoke __aexit__.
     context.__aexit__.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chat_request_drains_usage_and_stops_at_done(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.unit.test_fast_benchmark_framing import chat_frame
+
+    consumed = []
+    blocks = [
+        chat_frame(choices=[{"index": 0, "delta": {"content": "first"}}], service_tier="priority"),
+        chat_frame(choices=[{"index": 0, "delta": {"content": "last"}}]),
+        chat_frame(choices=[{"index": 0, "delta": {}, "finish_reason": "stop"}]),
+        chat_frame(
+            choices=[],
+            usage={
+                "prompt_tokens": 100,
+                "completion_tokens": 500,
+                "completion_tokens_details": {"reasoning_tokens": 100},
+                "prompt_tokens_details": {"cached_tokens": 50},
+            },
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    async def chunks():
+        for i, block in enumerate(blocks):
+            consumed.append(i)
+            yield block
+        raise AssertionError("must stop at DONE, not wait for EOF")
+
+    ticks = iter([10.0, 12.0, 16.0, 18.0, 19.0, 19.5, 20.0])
+    monkeypatch.setattr("scripts.qa.fast_benchmark.time", MagicMock(monotonic=lambda: next(ticks)))
+    response = MagicMock(status=200, content_type="text/event-stream", headers={"x-request-id": "req-chat"})
+    response.content.iter_any.return_value = chunks()
+    context = AsyncMock()
+    context.__aenter__.return_value = response
+    session = MagicMock(spec=aiohttp.ClientSession)
+    session.post.return_value = context
+    result = await request(session, config(), Trial(0, "p", MODELS[0], True), 5.0, "chat")
+    assert consumed == list(range(5))
+    context.__aexit__.assert_awaited_once()
+    assert result["errors"] == []
+    assert result["surface"] == "chat" and result["route"] == "/v1/chat/completions"
+    assert result["request_id"] == "req-chat"
+    assert result["terminal_seconds"] == 8.0 and result["e2e_seconds"] == 10.0
+    assert result["ttfo_seconds"] == 2.0 and result["last_visible_seconds"] == 6.0
+    assert result["input_tokens"] == 100 and result["output_tokens"] == 500
+    assert result["reasoning_tokens"] == 100 and result["cached_tokens"] == 50
+    assert result["event_tiers"][0]["service_tier"] == "priority"
+    assert session.post.call_args.args[0] == "https://invalid.example/v1/chat/completions"
+    assert session.post.call_args.kwargs["allow_redirects"] is False
+    assert "dummy-test-key" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["responses", "chat", "codex"])
+async def test_campaign_preserves_surface_pair_model_grouping(
+    surface: Surface, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_request(session, cfg, trial, timeout, selected_surface):
+        assert selected_surface == surface
+        return {**sample(trial.model, trial.round, trial.fast, 1.0), "surface": selected_surface}
+
+    monkeypatch.setattr("scripts.qa.fast_benchmark.request", fake_request)
+    result = await run(config(), 2, 17, 5.0, surface)
+    assert result["surface"] == surface
+    assert len(result["samples"]) == 12
+    for model in MODELS:
+        assert result["summary"]["per_model"][model]["paired"]["e2e_seconds"]["n"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_journal_survives_later_failure(
+    failure: type[BaseException], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = tmp_path / "campaign.jsonl"
+    completed = []
+    fsync = MagicMock(wraps=os.fsync)
+    monkeypatch.setattr("scripts.qa.fast_benchmark.os.fsync", fsync)
+
+    async def fake_request(session, cfg, trial, timeout, surface):
+        if completed:
+            assert [json.loads(line) for line in journal.read_text().splitlines()] == completed
+            raise failure("interrupted")
+        row = {
+            **sample(trial.model, trial.round, trial.fast, 1.0),
+            "surface": surface,
+            "request_id": "req-first",
+            "ttfo_seconds": 0.25,
+            "seed": 17,
+        }
+        completed.append(row)
+        return row
+
+    monkeypatch.setattr("scripts.qa.fast_benchmark.request", fake_request)
+    with pytest.raises(failure):
+        await run(config(), 2, 17, 5.0, "chat", journal=journal)
+    assert [json.loads(line) for line in journal.read_text().splitlines()] == completed
+    fsync.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_existing_journal_never_replays(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    journal = tmp_path / "old.jsonl"
+    journal.write_text('{"request_id":"old"}\n')
+    requester = AsyncMock()
+    monkeypatch.setattr("scripts.qa.fast_benchmark.request", requester)
+    with pytest.raises(FileExistsError):
+        await run(config(), 2, 17, 5.0, journal=journal)
+    requester.assert_not_awaited()
+    assert journal.read_text() == '{"request_id":"old"}\n'
+
+
+@pytest.mark.asyncio
+async def test_campaign_timeout_rejects_invalid_limits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    journal = tmp_path / "bounded.jsonl"
+    requester = AsyncMock()
+    monkeypatch.setattr("scripts.qa.fast_benchmark.request", requester)
+    for invalid in [0.0, -1.0, float("inf"), float("nan")]:
+        with pytest.raises(ValueError):
+            await run(config(), 2, 17, 5.0, campaign_timeout=invalid)
+    requester.assert_not_awaited()
+    assert not journal.exists()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_cli_journal_selection(explicit: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = tmp_path / "campaign.json"
+    journal = tmp_path / "explicit.jsonl" if explicit else output.with_suffix(".jsonl")
+    runner = AsyncMock(return_value={"samples": []})
+    monkeypatch.setattr("scripts.qa.fast_benchmark.run", runner)
+    monkeypatch.setattr("scripts.qa.fast_benchmark.load_config", lambda path: config())
+    argv = ["fast_benchmark.py", "unused.json", "--output", str(output), "--rounds", "2", "--campaign-timeout", "900"]
+    if explicit:
+        argv += ["--journal", str(journal)]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert main() == 0
+    assert runner.call_args.kwargs == {"journal": journal, "campaign_timeout": 900.0}
+    assert runner.call_args.args[1] == 2
+    assert json.loads(output.read_text()) == {"samples": []}
+
+
+@pytest.mark.parametrize("surface", [None, "responses", "chat", "codex"])
+def test_cli_selects_surface(
+    surface: str | None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    runner = AsyncMock(return_value={"samples": []})
+    monkeypatch.setattr("scripts.qa.fast_benchmark.run", runner)
+    monkeypatch.setattr("scripts.qa.fast_benchmark.load_config", lambda path: config())
+    monkeypatch.setattr(sys, "argv", ["fast_benchmark.py", "unused.json"] + (["--surface", surface] if surface else []))
+    assert main() == 0
+    assert runner.call_args.args[-1] == (surface or "responses")
+    assert json.loads(capsys.readouterr().out) == {"samples": []}

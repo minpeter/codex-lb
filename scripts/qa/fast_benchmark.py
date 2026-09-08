@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sequential paired Responses benchmark; network access occurs only via the CLI.
+"""Sequential paired B HTTP benchmark; network access occurs only via the CLI.
 
 Config is a mode-0600 JSON file with base_url (API prefix, e.g. /v1), keys
 (model -> key), reasoning_effort (optional model -> low|minimal), and boolean
@@ -23,6 +23,7 @@ import re
 import stat
 import statistics
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -87,6 +88,7 @@ METRICS = (
     "total_output_tokens_per_terminal_second",
 )
 Effort = Literal["low", "minimal"]
+Surface = Literal["responses", "chat", "codex"]
 
 
 @dataclass(frozen=True)
@@ -101,9 +103,7 @@ def load_config(path: Path) -> Config:
     with path.open(encoding="utf-8") as handle:
         mode = os.fstat(handle.fileno())
         if not stat.S_ISREG(mode.st_mode) or mode.st_mode & 0o077:
-            raise ValueError(
-                "config must be a regular file with no group/other permissions"
-            )
+            raise ValueError("config must be a regular file with no group/other permissions")
         try:
             value = json.load(handle)
         except json.JSONDecodeError:
@@ -130,9 +130,7 @@ def load_config(path: Path) -> Config:
     except ValueError:
         valid_url = False
     if not valid_url:
-        raise ValueError(
-            "base_url must be HTTP(S), without userinfo, query or fragment"
-        )
+        raise ValueError("base_url must be HTTP(S), without userinfo, query or fragment")
     keys = value.get("keys")
     efforts = value.get("reasoning_effort", {})
     if not isinstance(keys, dict) or not isinstance(efforts, dict):
@@ -169,9 +167,7 @@ def parse_usage(value: object) -> Usage:
     return Usage(
         token_count(value.get("input_tokens")),
         token_count(value.get("output_tokens")),
-        token_count(output.get("reasoning_tokens"))
-        if isinstance(output, dict)
-        else None,
+        token_count(output.get("reasoning_tokens")) if isinstance(output, dict) else None,
         token_count(inputs.get("cached_tokens")) if isinstance(inputs, dict) else None,
     )
 
@@ -221,8 +217,12 @@ class SSEParser:
         self._finished = False
         self._index = 0
 
+    @property
+    def done(self) -> bool:
+        return self.response.terminal_type is not None
+
     def feed(self, chunk: bytes, timestamp: float) -> None:
-        if self._finished or self.response.terminal_type is not None:
+        if self._finished or self.done:
             return
         try:
             text = self._decoder.decode(chunk)
@@ -244,7 +244,7 @@ class SSEParser:
             if char in "\r\n":
                 self._consume_line(timestamp)
                 self._after_cr = char == "\r"
-                if self.response.terminal_type is not None:
+                if self.done:
                     break
             else:
                 self._size += 1
@@ -321,14 +321,8 @@ class SSEParser:
             error = obj if event == "error" else envelope.get("error")
             if not isinstance(error, dict):
                 error = envelope.get("incomplete_details")
-            code = (
-                error.get("code", error.get("reason"))
-                if isinstance(error, dict)
-                else None
-            )
-            self.response.terminal_error_code = (
-                code if isinstance(code, str) and code in ERROR_CODES else "other"
-            )
+            code = error.get("code", error.get("reason")) if isinstance(error, dict) else None
+            self.response.terminal_error_code = code if isinstance(code, str) and code in ERROR_CODES else "other"
         elif not isinstance(response, dict):
             self.response.error("invalid_terminal_response")
 
@@ -347,6 +341,107 @@ class SSEParser:
             if value is None:
                 self.response.error(f"missing_terminal_{name}")
         return self.response
+
+
+class ChatSSEParser(SSEParser):
+    """A finish chunk is not EOF: usage arrives before the Chat-only DONE marker."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._done = False
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    def _consume_event(self, raw: str, timestamp: float) -> None:
+        if raw == "[DONE]":
+            self._done = True
+            if self.response.terminal_type is None:
+                self.response.error("done_without_chat_finish")
+            return
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, RecursionError):
+            self.response.error("invalid_sse_json")
+            return
+        if not isinstance(obj, dict):
+            self.response.error("invalid_event_shape")
+            return
+        error = obj.get("error")
+        if error is not None:
+            self.response.terminal_type = "chat.error"
+            self.response.terminal_timestamp = timestamp
+            code = error.get("code", error.get("type")) if isinstance(error, dict) else None
+            self.response.terminal_error_code = code if isinstance(code, str) and code in ERROR_CODES else "other"
+            self.response.error("chat_error")
+            return
+        choices = obj.get("choices")
+        if not isinstance(choices, list) or len(choices) > 1:
+            self.response.error("invalid_event_shape")
+            return
+        tier = obj.get("service_tier")
+        safe_tier = tier if isinstance(tier, str) and tier in TIERS else None
+        if tier is not None and safe_tier is None:
+            self.response.error("unknown_service_tier")
+        if len(self.response.event_tiers) < 10000:
+            self.response.event_tiers.append(
+                EventTier(self._index, "chat.chunk" if choices else "chat.usage", timestamp, safe_tier)
+            )
+        else:
+            self.response.error("event_metadata_limit")
+        self._index += 1
+        if obj.get("usage") is not None:
+            value = obj["usage"]
+            if isinstance(value, dict):
+                self.response.usage = parse_usage(
+                    {
+                        "input_tokens": value.get("prompt_tokens"),
+                        "output_tokens": value.get("completion_tokens"),
+                        "input_tokens_details": value.get("prompt_tokens_details"),
+                        "output_tokens_details": value.get("completion_tokens_details"),
+                    }
+                )
+            else:
+                self.response.error("invalid_chat_usage")
+        if not choices:
+            return
+        choice = choices[0]
+        if not isinstance(choice, dict) or choice.get("index") != 0:
+            self.response.error("invalid_event_shape")
+            return
+        if self.response.terminal_type is not None:
+            self.response.error("chat_choice_after_finish")
+            return
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            self.response.error("invalid_event_shape")
+            return
+        content = delta.get("content")
+        if content is not None and not isinstance(content, str):
+            self.response.error("invalid_text_delta")
+        elif content:
+            if self.response.first_text_timestamp is None:
+                self.response.first_text_timestamp = timestamp
+            self.response.last_text_timestamp = timestamp
+            self.response.visible_delta_count += 1
+        finish = choice.get("finish_reason")
+        if finish is not None:
+            safe_finish = (
+                finish
+                if isinstance(finish, str)
+                and finish in {"stop", "length", "content_filter", "tool_calls", "function_call"}
+                else "other"
+            )
+            self.response.terminal_type = "chat." + safe_finish
+            self.response.terminal_timestamp = timestamp
+            if safe_finish != "stop":
+                self.response.error("chat_" + safe_finish)
+
+    def finish(self) -> ParsedResponse:
+        if not self._done:
+            self.response.error("missing_chat_done")
+        return super().finish()
 
 
 @dataclass(frozen=True)
@@ -377,11 +472,7 @@ def metrics(parsed: ParsedResponse, started: float, ended: float) -> dict[str, A
     terminal = parsed.terminal_timestamp
     output = parsed.usage.output_tokens
     reasoning = parsed.usage.reasoning_tokens
-    visible = (
-        output - reasoning
-        if output is not None and reasoning is not None and output >= reasoning
-        else None
-    )
+    visible = output - reasoning if output is not None and reasoning is not None and output >= reasoning else None
     e2e = ended - started
     duration = terminal - started if terminal is not None else None
     span = last - first if first is not None and last is not None else None
@@ -399,39 +490,29 @@ def metrics(parsed: ParsedResponse, started: float, ended: float) -> dict[str, A
         "terminal_seconds": duration,
         "output_span_seconds": span,
         "visible_tokens": visible,
-        "visible_tokens_per_e2e_second": visible / e2e
-        if visible is not None and e2e > 0
-        else None,
+        "visible_tokens_per_e2e_second": visible / e2e if visible is not None and e2e > 0 else None,
         "approx_visible_tokens_per_output_second": visible / span
         if visible is not None and span is not None and span > 0
         else None,
         "approx_output_rate_unavailable_reason": reason,
         "total_output_tokens_per_terminal_second": (
-            output / duration
-            if output is not None and duration is not None and duration > 0
-            else None
+            output / duration if output is not None and duration is not None and duration > 0 else None
         ),
     }
 
 
-def bootstrap_interval(
-    values: list[float], seed: int, draws: int = 2000
-) -> list[float] | None:
+def bootstrap_interval(values: list[float], seed: int, draws: int = 2000) -> list[float] | None:
     """Seeded percentile 95% CI for mean paired delta; undefined for <2 pairs."""
     if len(values) < 2:
         return None
     rng = random.Random(seed)
-    estimates = sorted(
-        statistics.mean(rng.choices(values, k=len(values))) for _ in range(draws)
-    )
+    estimates = sorted(statistics.mean(rng.choices(values, k=len(values))) for _ in range(draws))
 
     def quantile(p: float) -> float:
         position = (len(estimates) - 1) * p
         lower = math.floor(position)
         upper = math.ceil(position)
-        return estimates[lower] + (estimates[upper] - estimates[lower]) * (
-            position - lower
-        )
+        return estimates[lower] + (estimates[upper] - estimates[lower]) * (position - lower)
 
     return [quantile(0.025), quantile(0.975)]
 
@@ -464,9 +545,7 @@ def summarize(samples: list[dict[str, Any]], seed: int) -> dict[str, Any]:
         for name in METRICS:
             deltas: list[dict[str, Any]] = []
             for (round_id, pair_id), arms in groups.items():
-                if set(arms) != {False, True} or any(
-                    row["errors"] for row in arms.values()
-                ):
+                if set(arms) != {False, True} or any(row["errors"] for row in arms.values()):
                     continue
                 standard, priority = arms[False][name], arms[True][name]
                 if standard is not None and priority is not None:
@@ -478,10 +557,7 @@ def summarize(samples: list[dict[str, Any]], seed: int) -> dict[str, Any]:
                         }
                     )
             values: list[float] = [row["delta"] for row in deltas]
-            higher_wins = (
-                name in RATE_METRICS
-                or name == "total_output_tokens_per_terminal_second"
-            )
+            higher_wins = name in RATE_METRICS or name == "total_output_tokens_per_terminal_second"
             paired[name] = {
                 "n": len(values),
                 "excluded_pairs": len(groups) - len(values),
@@ -505,7 +581,7 @@ def summarize(samples: list[dict[str, Any]], seed: int) -> dict[str, Any]:
     }
 
 
-def request_payload(config: Config, trial: Trial) -> dict[str, Any]:
+def request_payload(config: Config, trial: Trial, surface: Surface = "responses") -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": trial.model,
         "input": PROMPT,
@@ -515,16 +591,41 @@ def request_payload(config: Config, trial: Trial) -> dict[str, Any]:
         # Includes reasoning; the prompt targets roughly 300-600 visible tokens.
         "max_output_tokens": 1600,
     }
+    if surface == "chat":
+        payload.pop("input")
+        payload.pop("reasoning")
+        payload.pop("max_output_tokens")
+        payload.update(
+            messages=[{"role": "user", "content": PROMPT}],
+            reasoning_effort=config.reasoning_effort[trial.model],
+            max_completion_tokens=1600,
+            stream_options={"include_usage": True},
+        )
+    elif surface == "codex":
+        payload["instructions"] = ""
+        payload["input"] = [{"role": "user", "content": [{"type": "input_text", "text": PROMPT}]}]
     if trial.fast:
         payload["service_tier"] = "priority"
     return payload
 
 
+def surface_url(config: Config, surface: Surface) -> str:
+    if surface == "codex":
+        parts = urlsplit(config.base_url)
+        return f"{parts.scheme}://{parts.netloc}/backend-api/codex/responses"
+    return config.base_url + ("/chat/completions" if surface == "chat" else "/responses")
+
+
 async def request(
-    session: aiohttp.ClientSession, config: Config, trial: Trial, timeout: float
+    session: aiohttp.ClientSession,
+    config: Config,
+    trial: Trial,
+    timeout: float,
+    surface: Surface = "responses",
 ) -> dict[str, Any]:
     started = time.monotonic()
-    parser = SSEParser()
+    parser = ChatSSEParser() if surface == "chat" else SSEParser()
+    url = surface_url(config, surface)
     status = None
     request_id = None
     errors: list[str] = []
@@ -532,8 +633,8 @@ async def request(
         # asyncio.timeout is an exact wall bound independent of aiohttp timeout rounding.
         async with asyncio.timeout(timeout):
             async with session.post(
-                config.base_url + "/responses",
-                json=request_payload(config, trial),
+                url,
+                json=request_payload(config, trial, surface),
                 headers={
                     "Authorization": f"Bearer {config.keys[trial.model]}",
                     "Accept": "text/event-stream",
@@ -557,7 +658,7 @@ async def request(
                 else:
                     async for chunk in response.content.iter_any():
                         parser.feed(chunk, time.monotonic())
-                        if parser.response.terminal_type is not None:
+                        if parser.done:
                             break
     except TimeoutError:
         errors.append("request_wall_timeout")
@@ -579,6 +680,8 @@ async def request(
         errors.append("invalid_token_accounting")
     return {
         **asdict(trial),
+        "surface": surface,
+        "route": urlsplit(url).path,
         **metrics(parsed, started, ended),
         **asdict(parsed.usage),
         "http_status": status,
@@ -587,25 +690,43 @@ async def request(
         "terminal_error_code": parsed.terminal_error_code,
         "errors": errors,
         "visible_delta_count": parsed.visible_delta_count,
-        "event_tiers": [
-            {**asdict(event), "timestamp": event.timestamp - started}
-            for event in parsed.event_tiers
-        ],
+        "event_tiers": [{**asdict(event), "timestamp": event.timestamp - started} for event in parsed.event_tiers],
     }
 
 
-async def run(config: Config, rounds: int, seed: int, timeout: float) -> dict[str, Any]:
+async def run(
+    config: Config,
+    rounds: int,
+    seed: int,
+    timeout: float,
+    surface: Surface = "responses",
+    *,
+    journal: Path | None = None,
+    campaign_timeout: float | None = None,
+) -> dict[str, Any]:
     trials = schedule(seed, rounds)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be positive and finite")
+    if campaign_timeout is not None and (not math.isfinite(campaign_timeout) or campaign_timeout <= 0):
+        raise ValueError("campaign timeout must be positive and finite")
     samples = []
-    async with aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=1), trust_env=False
-    ) as session:
-        for trial in trials:
-            samples.append(await request(session, config, trial, timeout))
+    # Exclusive creation prevents mixing campaigns or silently replaying an interrupted run.
+    with journal.open("x", encoding="utf-8") if journal else nullcontext() as checkpoint:
+        async with (
+            asyncio.timeout(campaign_timeout),
+            aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=1), trust_env=False) as session,
+        ):
+            for trial in trials:
+                row = await request(session, config, trial, timeout, surface)
+                samples.append(row)
+                if checkpoint is not None:
+                    checkpoint.write(json.dumps({**row, "seed": seed}, allow_nan=False) + "\n")
+                    checkpoint.flush()
+                    os.fsync(checkpoint.fileno())
     return {
         "schema_version": 1,
+        "surface": surface,
+        "route": urlsplit(surface_url(config, surface)).path,
         "seed": seed,
         "rounds": rounds,
         "concurrency": 1,
@@ -629,15 +750,39 @@ def main() -> int:
     parser.add_argument("--rounds", "--repeats", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260908)
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--surface", choices=("responses", "chat", "codex"), default="responses")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--journal", type=Path, help="new JSONL checkpoint; defaults to --output with .jsonl suffix")
+    parser.add_argument(
+        "--campaign-timeout", type=float, help="wall limit for the whole run; completed requests stay journaled"
+    )
     args = parser.parse_args()
     try:
+        journal = args.journal or (args.output.with_suffix(".jsonl") if args.output else None)
+        if args.output and journal and args.output.resolve() == journal.resolve():
+            raise ValueError("output and journal must be different paths")
+        if args.output and args.output.exists():
+            raise ValueError("output already exists; use a new campaign path")
         config = load_config(args.config)
-        result = asyncio.run(run(config, args.rounds, args.seed, args.timeout))
+        result = asyncio.run(
+            run(
+                config,
+                args.rounds,
+                args.seed,
+                args.timeout,
+                args.surface,
+                journal=journal,
+                campaign_timeout=args.campaign_timeout,
+            )
+        )
     except ValueError as error:
         parser.error(str(error))
+    except FileExistsError:
+        parser.error("journal already exists; use a new campaign path; no requests replayed")
+    except TimeoutError:
+        parser.error("campaign wall timeout; completed requests remain in the journal if configured")
     except OSError:
-        parser.error("unable to read protected configuration or initialize runtime")
+        parser.error("configuration, runtime or checkpoint I/O failed; completed journal records are retained")
     text = json.dumps(result, indent=2, allow_nan=False) + "\n"
     if args.output:
         args.output.write_text(text, encoding="utf-8")
