@@ -7,5 +7,5 @@
 - [x] Verify hard-owner, no-alternative, generic retry and settlement regressions.
 - [x] Verify remote credential mode, typing, lint and architecture constraints.
 - [x] Exercise actual multi-account HTTP recovery and clean test resources.
-- [ ] Commit, push, build and deploy B; verify actual Astra inference.
-- [ ] Compare a bounded post-deployment observation window and report limits.
+- [x] Commit, push, build and deploy B; verify actual Astra inference.
+- [x] Compare a bounded post-deployment observation window and report limits.
