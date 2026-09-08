@@ -77,7 +77,9 @@ ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 # bound-eventless-server-recovery spec called it "configured"; the maintainer
 # asked for it to be promoted to a setting on PR #1633 (2026-08-20/08-26),
 # consistent with that PR's budget-from-settings principle.
-MAX_SETTINGS_FIELDS = 133
+# 133 -> 135: PR2166 adds overload isolation duration and error-rate weighting.
+# Preserve the separately bounded five-field remote-credential surface.
+MAX_SETTINGS_FIELDS = 135
 # This fork adds one explicitly bounded integration surface. Keep the upstream
 # ratchet unchanged and permit only these five named fields, not arbitrary
 # growth. The why-not-a-default rationale is recorded in the owning capability

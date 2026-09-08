@@ -22,7 +22,7 @@ source load.
 ## Configuration budget
 
 The fork's remote integration adds exactly five named fields while preserving
-the upstream settings ratchet of 133 fields. The generated settings reference
+the upstream settings ratchet of 135 fields after PR2166. The generated settings reference
 includes both surfaces; the fork allowance must not admit unrelated settings.
 
 - Source URL selects the deployment-specific credential authority and enables

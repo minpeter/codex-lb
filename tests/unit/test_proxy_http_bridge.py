@@ -28485,6 +28485,7 @@ async def test_create_http_bridge_session_does_not_classify_post_selection_failu
 @pytest.mark.asyncio
 async def test_stream_via_http_bridge_fails_closed_before_file_affinity_when_previous_response_owner_misses(
     monkeypatch: pytest.MonkeyPatch,
+    db_setup,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     await service._pin_file_account("file_from_other_account", "acc-file")
