@@ -77,9 +77,8 @@ class _OverloadBalancerLike(Protocol):
     async def _get_account_lock(self, account_id: str) -> Any: ...
 
 
-# The trip level at which sustained overload escalates from soft backoff to
-# isolation: the third trip means at least nine rejections inside a few
-# minutes despite the account already being deprioritized twice.
+# Default entry level; operators may select an earlier or later trip through
+# CODEX_LB_PROXY_OVERLOAD_ISOLATION_TRIP_LEVEL.
 OVERLOAD_ISOLATION_TRIP_LEVEL = 3
 
 
@@ -88,17 +87,22 @@ class OverloadIsolationPolicy:
     """Operator knob for the isolation stage (``CODEX_LB_PROXY_OVERLOAD_ISOLATION_SECONDS``)."""
 
     seconds: float = 1800.0
+    trip_level: int = OVERLOAD_ISOLATION_TRIP_LEVEL
 
     @classmethod
     def from_settings(cls) -> OverloadIsolationPolicy:
-        return cls(seconds=float(get_settings().proxy_overload_isolation_seconds))
+        settings = get_settings()
+        return cls(
+            seconds=float(settings.proxy_overload_isolation_seconds),
+            trip_level=settings.proxy_overload_isolation_trip_level,
+        )
 
     @property
     def enabled(self) -> bool:
         return self.seconds > 0.0
 
     def isolates(self, level: int) -> bool:
-        return self.enabled and level >= OVERLOAD_ISOLATION_TRIP_LEVEL
+        return self.enabled and level >= self.trip_level
 
 
 def overload_backoff_seconds(level: int) -> float:

@@ -7,7 +7,7 @@ Regenerate with `uv run python scripts/generate_settings_reference.py`;
 `tests/unit/test_settings_reference.py` fails when this page drifts from
 `app/core/config/settings.py`.
 
-codex-lb currently exposes 140 settings. Every setting is an environment
+codex-lb currently exposes 141 settings. Every setting is an environment
 variable with the `CODEX_LB_` prefix (process environment or `.env` /
 `.env.local` next to the process). All defaults work with zero configuration —
 start from [Configuration](../configuration.md) for the handful that matter,
@@ -133,6 +133,7 @@ the env-file locations have to be known before env files are read.
 | `CODEX_LB_PROXY_COMPACT_RESPONSE_CREATE_LIMIT` | `int` | `64` |
 | `CODEX_LB_PROXY_DOWNSTREAM_WEBSOCKET_IDLE_TIMEOUT_SECONDS` | `float` | `120.0` |
 | `CODEX_LB_PROXY_OVERLOAD_ISOLATION_SECONDS` | `int` | `1800` |
+| `CODEX_LB_PROXY_OVERLOAD_ISOLATION_TRIP_LEVEL` | `int` | `3` |
 | `CODEX_LB_PROXY_REFRESH_FAILURE_COOLDOWN_SECONDS` | `float` | `5.0` |
 | `CODEX_LB_PROXY_REQUEST_BUDGET_SECONDS` | `float` | `600.0` |
 | `CODEX_LB_PROXY_RESPONSE_CREATE_LIMIT` | `int` | `256` |

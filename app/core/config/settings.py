@@ -496,12 +496,13 @@ class Settings(BaseSettings):
     proxy_api_key_fair_share_congestion_threshold_pct: int = Field(default=0, ge=0, le=100)
     proxy_account_inflight_penalty_pct: float = Field(default=2.5, ge=0)
     # Upstream overload (``server_is_overloaded``) handling. Soft backoff and
-    # the isolation trip level are fixed constants in
+    # the observation window are fixed constants in
     # ``app/modules/proxy/_load_balancer/overload_backoff.py``; this is how long
     # a sustained-overload account is isolated (fresh selection avoids it and
     # soft sticky owners are rerouted while another candidate exists). ``0``
     # disables the isolation stage and keeps the soft backoff only.
     proxy_overload_isolation_seconds: int = Field(default=1800, ge=0)
+    proxy_overload_isolation_trip_level: int = Field(default=3, ge=1, le=5)
     # Weighted routing strategies (``capacity_weighted``, ``relative_availability``)
     # discount each candidate's draw weight by its recent upstream error rate
     # (window, sample floor and weight floor are fixed constants in

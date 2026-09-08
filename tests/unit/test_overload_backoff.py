@@ -8,11 +8,12 @@ from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 
 import app.modules.proxy._service.streaming.helpers as streaming_helpers_module
 from app.core.balancer import ERROR_BACKOFF_THRESHOLD
 from app.core.balancer.logic import AccountState
-from app.core.config.settings import get_settings
+from app.core.config.settings import Settings, get_settings
 from app.core.crypto import TokenEncryptor
 from app.db.models import Account, AccountStatus, StickySessionKind
 from app.modules.proxy._load_balancer.overload_backoff import (
@@ -390,6 +391,52 @@ async def test_fresh_sticky_binding_reports_the_pool_it_selected_from() -> None:
 
 
 # --- isolation stage -------------------------------------------------------
+
+
+@pytest.mark.parametrize("entry_level", [1, 2, 3, 5])
+def test_isolation_entry_level_is_configured_from_environment(monkeypatch, entry_level: int) -> None:
+    monkeypatch.setenv("CODEX_LB_PROXY_OVERLOAD_ISOLATION_TRIP_LEVEL", str(entry_level))
+    monkeypatch.setenv("CODEX_LB_PROXY_OVERLOAD_ISOLATION_SECONDS", "900")
+    get_settings.cache_clear()
+    try:
+        policy = OverloadIsolationPolicy.from_settings()
+        runtime = RuntimeState()
+        now = 1000.0
+        for level in range(1, entry_level + 1):
+            for _ in range(OVERLOAD_TRIP_COUNT - 1):
+                assert record_overload_rejection_locked(runtime, now, isolation=policy) is None
+            deadline = record_overload_rejection_locked(runtime, now, isolation=policy)
+            assert deadline is not None
+            assert overload_isolation_active(runtime, now) is (level >= entry_level)
+            assert deadline - now == pytest.approx(900 if level >= entry_level else overload_backoff_seconds(level))
+            now = deadline + 1
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("value", ["0", "6", "-1", "2.5", "invalid"])
+def test_isolation_entry_level_rejects_invalid_environment(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("CODEX_LB_PROXY_OVERLOAD_ISOLATION_TRIP_LEVEL", value)
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_isolation_entry_defaults_and_disabled_duration(monkeypatch) -> None:
+    monkeypatch.delenv("CODEX_LB_PROXY_OVERLOAD_ISOLATION_TRIP_LEVEL", raising=False)
+    monkeypatch.delenv("CODEX_LB_PROXY_OVERLOAD_ISOLATION_SECONDS", raising=False)
+    get_settings.cache_clear()
+    try:
+        policy = OverloadIsolationPolicy.from_settings()
+        assert policy.seconds == 1800
+        assert not policy.isolates(2)
+        assert policy.isolates(3)
+        monkeypatch.setenv("CODEX_LB_PROXY_OVERLOAD_ISOLATION_TRIP_LEVEL", "1")
+        monkeypatch.setenv("CODEX_LB_PROXY_OVERLOAD_ISOLATION_SECONDS", "0")
+        get_settings.cache_clear()
+        disabled = OverloadIsolationPolicy.from_settings()
+        assert not any(disabled.isolates(level) for level in range(1, 6))
+    finally:
+        get_settings.cache_clear()
 
 
 def test_isolation_engages_at_the_trip_level_and_holds_for_the_configured_interval() -> None:

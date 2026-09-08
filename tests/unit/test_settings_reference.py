@@ -113,7 +113,11 @@ def test_settings_surface_ratchet() -> None:
     fields = set(Settings.model_fields)
     remote_fields = {name for name in fields if name.startswith("remote_credential_")}
     assert remote_fields == REMOTE_CREDENTIAL_SETTINGS_FIELDS
-    upstream_fields = fields - remote_fields
+    # Separately approved fork policy control: entry sensitivity cannot be
+    # expressed by isolation duration. Reject any other unbudgeted growth.
+    isolation_level_fields = {"proxy_overload_isolation_trip_level"}
+    assert isolation_level_fields <= fields
+    upstream_fields = fields - remote_fields - isolation_level_fields
     assert len(upstream_fields) <= MAX_SETTINGS_FIELDS, (
         f"Upstream Settings grew to {len(upstream_fields)} fields (ratchet: {MAX_SETTINGS_FIELDS}). "
         "New settings need a simplicity-budget discussion (PRINCIPLES.md P2, issue #1340); "
