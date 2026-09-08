@@ -96,6 +96,7 @@ class Config:
     base_url: str
     keys: dict[str, str] = field(repr=False)
     reasoning_effort: dict[str, Effort]
+    headers: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def load_config(path: Path) -> Config:
@@ -144,7 +145,33 @@ def load_config(path: Path) -> Config:
         if effort not in ("low", "minimal"):
             raise ValueError("reasoning effort must be low or minimal")
         resolved[model] = effort
-    return Config(url.rstrip("/"), {model: keys[model] for model in MODELS}, resolved)
+    headers = value.get("headers", {})
+    if not isinstance(headers, dict) or len({name.lower() for name in headers}) != len(headers) or any(
+        not isinstance(name, str)
+        or not re.fullmatch(r"[!#$%&\x27*+.^_`|~0-9A-Za-z-]+", name)
+        or name.lower()
+        in {
+            "authorization",
+            "accept",
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "content-type",
+            "connection",
+            "keep-alive",
+            "te",
+            "trailer",
+            "upgrade",
+            "proxy-connection",
+            "proxy-authorization",
+            "proxy-authenticate",
+        }
+        or not isinstance(content, str)
+        or any(ord(char) < 32 or ord(char) > 126 for char in content)
+        for name, content in headers.items()
+    ):
+        raise ValueError("headers must be printable HTTP headers without auth or framing overrides")
+    return Config(url.rstrip("/"), {model: keys[model] for model in MODELS}, resolved, headers)
 
 
 @dataclass
@@ -646,6 +673,7 @@ async def request(
                 url,
                 json=request_payload(config, trial, surface),
                 headers={
+                    **config.headers,
                     "Authorization": f"Bearer {config.keys[trial.model]}",
                     "Accept": "text/event-stream",
                 },

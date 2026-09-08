@@ -401,7 +401,53 @@ def test_default_payload_is_unchanged() -> None:
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["responses", "chat", "codex"])
+@pytest.mark.parametrize("fast", [False, True])
+async def test_optional_provider_headers_reach_all_arms(tmp_path: Path, surface: Surface, fast: bool) -> None:
+    headers = {"User-Agent": "test-agent/1", "originator": "test-agent", "version": "1"}
+    path = tmp_path / "headers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "base_url": config().base_url,
+                "keys": config().keys,
+                "headers": headers,
+                "standard_tier_unenforced_verified": True,
+                "single_account_per_model_verified": True,
+            }
+        )
+    )
+    path.chmod(0o600)
+    cfg = load_config(path)
+    context = AsyncMock()
+    context.__aenter__.return_value = MagicMock(status=400, headers={})
+    session = MagicMock(spec=aiohttp.ClientSession)
+    session.post.return_value = context
+    await request(session, cfg, Trial(0, "p", MODELS[0], fast), 5.0, surface)
+    sent = session.post.call_args.kwargs
+    assert {name: sent["headers"].get(name) for name in headers} == headers
+    assert sent["headers"]["Authorization"] == "Bearer " + cfg.keys[MODELS[0]]
+    assert sent["headers"]["Accept"] == "text/event-stream"
+    assert sent["json"].get("service_tier") == ("priority" if fast else None)
+
+
 def test_protected_config_attestations(tmp_path: Path) -> None:
+    duplicate_path = tmp_path / "duplicate.json"
+    duplicate_path.write_text(
+        json.dumps(
+            {
+                "base_url": config().base_url,
+                "keys": config().keys,
+                "headers": {"X-Test": "one", "x-test": "two"},
+                "standard_tier_unenforced_verified": True,
+                "single_account_per_model_verified": True,
+            }
+        )
+    )
+    duplicate_path.chmod(0o600)
+    with pytest.raises(ValueError, match="headers"):
+        load_config(duplicate_path)
     path = tmp_path / "config.json"
     value = {
         "base_url": "https://invalid.example/v1",
