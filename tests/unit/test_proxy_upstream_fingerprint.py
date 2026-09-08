@@ -61,6 +61,26 @@ def test_routing_hint_is_hop_local_for_responses_http_and_websocket():
     assert "x-codex-routing-hint" not in _lower_keys(websocket_headers)
 
 
+def test_chatgpt_account_route_synthesizes_priority_routing_hint_with_api_key():
+    headers = _build_upstream_headers(
+        {"User-Agent": "OpenAI/Python", "X-Codex-Routing-Hint": "model=evil;tier=default"},
+        "tok",
+        "acct-1",
+        routing_hint=("gpt-6-astra", "priority"),
+    )
+    assert headers["x-codex-routing-hint"] == "model=gpt-6-astra;tier=priority"
+
+
+def test_api_key_authentication_does_not_disable_account_backend_hint():
+    headers = _build_upstream_websocket_headers(
+        {"User-Agent": "OpenAI/Python", "X-Codex-Routing-Hint": "model=evil;tier=default"},
+        "tok",
+        "acct-1",
+        routing_hint=("gpt-6-astra", "priority"),
+    )
+    assert headers["x-codex-routing-hint"] == "model=gpt-6-astra;tier=priority"
+
+
 def test_non_native_request_uses_pascalcase_account_header():
     with patch.object(proxy_module.get_codex_version_cache(), "cached_version_or_default", return_value="0.142.0"):
         headers = _build_upstream_headers({"User-Agent": "OpenAI/Python 2.24.0"}, "tok", "acct-9")

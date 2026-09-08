@@ -580,7 +580,11 @@ class _StreamingMixin(_StreamingRetryMixin):
                 "codex_installation_id": account.codex_installation_id,
                 "enforce_openai_sdk_contract": enforce_openai_sdk_contract,
                 "codex_lb_account_id": account.id,
-                "synthesize_routing_hint": api_key is None,
+                # The client-facing API key authenticates the caller; the
+                # selected account still determines the ChatGPT/Codex
+                # backend egress. Synthesize the first-party hint whenever a
+                # ChatGPT account is selected, including API-key callers.
+                "synthesize_routing_hint": account_id is not None,
             }
             if upstream_stream_transport is not None:
                 stream_optional_kwargs["upstream_stream_transport_override"] = upstream_stream_transport
