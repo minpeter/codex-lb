@@ -1,0 +1,44 @@
+services:
+  replica:
+    image: codex-lb-b:${CODEX_LB_REPLICA_TAG:-local}
+    build:
+      context: ../..
+      dockerfile: deploy/replica/Dockerfile
+      args:
+        SOURCE_REVISION: ${CODEX_LB_REPLICA_REVISION:-unknown}
+    container_name: codex-lb-b
+    restart: unless-stopped
+    env_file:
+      - ${CODEX_LB_REPLICA_ENV_FILE:?Set the protected replica environment file}
+    environment:
+      CODEX_LB_DATA_DIR: /var/lib/codex-lb
+      CODEX_LB_ENCRYPTION_KEY_FILE: /var/lib/codex-lb/encryption.key
+      CODEX_LB_REMOTE_CREDENTIAL_SOURCE_PASSWORD_FILE: /run/secrets/source_password
+    ports:
+      - "10.10.10.10:2455:2455"
+    volumes:
+      - replica-data:/var/lib/codex-lb
+    secrets:
+      - source_password
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:2455/health/ready', timeout=5).close()"
+      interval: 30s
+      timeout: 8s
+      start_period: 60s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+secrets:
+  source_password:
+    file: ${CODEX_LB_REPLICA_PASSWORD_FILE:?Set the protected source password file}
+
+volumes:
+  replica-data:
