@@ -1,0 +1,18 @@
+- [x] Verify WS expired-request ownership and late response isolation.
+- [x] Verify stale administrator credentials cannot authorize any auth entry.
+- [x] Preserve orphaned API-key account scope on unrelated edits.
+- [x] Preserve orphaned automation account scope on unrelated edits.
+- [x] Skip pending-delete remote accounts without sync-wide PK conflicts.
+- [x] Close eager source stream leases before first body iteration.
+- [x] Release source reservations on setup cancellation and repeated cancel.
+- [x] Fall back to eligible full-pool accounts under drain strategies.
+- [x] Use captured raw peer for trusted-header auth and sanitization.
+- [x] Settle before a single terminal health penalty.
+- [x] Respect absolute deadlines through backoff and same-account retry.
+- [x] Honor exclusions on cached and inflight bridge reuse safely.
+- [x] Match SQLite runtime and maintenance paths for literal hash characters.
+- [x] Retain the newest same-second backup during rotation.
+- [x] Ignore stale manual OAuth callback success and failure.
+- [ ] Complete integrated tests, real-surface QA and independent review.
+- [ ] Commit verified increments, deploy B and verify preserved settings.
+- [x] Verify the B image includes the rebuilt scope-preserving frontend.

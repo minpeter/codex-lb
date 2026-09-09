@@ -1,5 +1,12 @@
 FROM ghcr.io/astral-sh/uv:0.12.8 AS uv-bin
 
+FROM oven/bun:1.4.0-alpine AS frontend-build
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY frontend ./
+RUN bun run build
+
 FROM ghcr.io/soju06/codex-lb@sha256:fb558395cbfb52dd51af2caf9aef836238e01abeb5794eacc252d6fc3ce5102d
 
 ARG SOURCE_REVISION
@@ -15,5 +22,6 @@ RUN UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --frozen --no-dev \
 COPY --chown=app:app app /app/app
 COPY --chown=app:app config /app/config
 COPY --chown=app:app scripts /app/scripts
+COPY --chown=app:app --from=frontend-build /app/app/static /app/app/static
 
 USER app
