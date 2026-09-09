@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,9 +57,19 @@ def create_sqlite_pre_migration_backup(
     _sqlite_backup(source, backup_path)
 
     backups = list_sqlite_pre_migration_backups(source)
+
+    def backup_order(path: Path) -> tuple[str, int]:
+        match = re.search(r"-(\d+)" + re.escape(source.suffix) + "$", path.name)
+        base = path.name.removesuffix(source.suffix)
+        if match:
+            base = base[: -len(match.group(1)) - 1]
+        return (base, int(match.group(1)) if match else 0)
+
+    backups.sort(key=backup_order)
     excess = len(backups) - max_files
     if excess > 0:
         for old_backup in backups[:excess]:
-            old_backup.unlink()
+            if old_backup != backup_path:
+                old_backup.unlink()
 
     return backup_path

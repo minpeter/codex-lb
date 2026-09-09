@@ -90,6 +90,11 @@ class TestSqlitePathFromUrlWindows:
         """URI-mode file databases need sidecars beside SQLite's real file."""
         assert sqlite_db_path_from_url(url) == expected
 
+    def test_posix_literal_hash_is_not_a_fragment(self) -> None:
+        url = "sqlite+aiosqlite:////tmp/store#blue.db"
+
+        assert sqlite_db_path_from_url(url) == Path("/tmp/store#blue.db")
+
     def test_file_uri_without_uri_mode_keeps_literal_path(self) -> None:
         assert sqlite_db_path_from_url("sqlite+aiosqlite:///file:shared?mode=memory&cache=shared") == Path(
             "file:shared"

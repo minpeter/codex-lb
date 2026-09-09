@@ -200,7 +200,8 @@ def sqlite_db_path_from_url(url: str) -> Path | None:
         path = path.partition("?")[0]
     else:
         path = path.partition("?")[0]
-        path = path.partition("#")[0]
+        if path.startswith("file:"):
+            path = path.partition("#")[0]
 
     # SQLAlchemy's `URL.render_as_string()` percent-encodes Windows drive and
     # UNC SQLite paths (e.g. `sqlite:///C%3A%5CUsers%5C...%5Cstore.db`). Decode

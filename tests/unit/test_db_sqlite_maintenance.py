@@ -97,6 +97,24 @@ def _close_connections(connections: list[_TrackedConnection]) -> None:
         connection.close()
 
 
+def test_same_second_backup_rotation_keeps_newest_backup(tmp_path: Path) -> None:
+    db_path = tmp_path / "store.db"
+    with closing(sqlite3.connect(db_path)) as connection, connection:
+        connection.execute("CREATE TABLE items (value INTEGER NOT NULL)")
+        connection.execute("INSERT INTO items VALUES (1)")
+
+    now = datetime(2026, 7, 29, tzinfo=timezone.utc)
+    first = create_sqlite_pre_migration_backup(db_path, max_files=1, now=now)
+    with closing(sqlite3.connect(db_path)) as connection, connection:
+        connection.execute("INSERT INTO items VALUES (2)")
+    second = create_sqlite_pre_migration_backup(db_path, max_files=1, now=now)
+
+    assert not first.exists()
+    assert second.exists()
+    with closing(sqlite3.connect(second)) as connection:
+        assert connection.execute("SELECT value FROM items ORDER BY value").fetchall() == [(1,), (2,)]
+
+
 def test_backup_closes_connections_before_rotating_old_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
