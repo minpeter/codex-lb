@@ -685,7 +685,10 @@ class _StreamingRetryMixin:
                     post_refresh_transient_replacement_selected = True
                 settled = await _settle_stream_usage_before_pending_penalty(current_settlement)
                 return settled
-            return True
+            settled = await _settle_stream_usage_before_pending_penalty(
+                current_settlement, settlement_order_required=True
+            )
+            return settled
 
         async def _finalize_terminal_settlement_after_downstream_close(
             current_settlement: _StreamSettlement,
@@ -936,9 +939,15 @@ class _StreamingRetryMixin:
                     raise
 
             while True:
+                remaining_attempt_budget = proxy._remaining_budget_seconds(deadline)
+                if remaining_attempt_budget <= 0:
+                    raise ProxyResponseError(
+                        504,
+                        openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+                    )
                 settlement.reset()
                 stream_timeout_tokens = _facade()._push_stream_attempt_timeout_overrides(
-                    proxy._remaining_budget_seconds(deadline)
+                    remaining_attempt_budget
                 )
                 try:
                     attempt_stream = _iter_stream_once()
@@ -1007,7 +1016,12 @@ class _StreamingRetryMixin:
                             delay,
                             exc.code,
                         )
-                        await scheduler.sleep(delay)
+                        await scheduler.sleep(min(delay, proxy._remaining_budget_seconds(deadline)))
+                        if proxy._remaining_budget_seconds(deadline) <= 0:
+                            raise ProxyResponseError(
+                                504,
+                                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+                            )
                         continue
                     error_message = str(exc.error.get("message") or "Upstream error")
                     settlement.record_success = False
@@ -2156,8 +2170,14 @@ class _StreamingRetryMixin:
                     transient_retries = 0
                     allow_retry_flag = attempt < max_attempts - 1
                     while True:
+                        remaining_attempt_budget = proxy._remaining_budget_seconds(deadline)
+                        if remaining_attempt_budget <= 0:
+                            raise ProxyResponseError(
+                                504,
+                                openai_error("upstream_request_timeout", "Proxy request budget exhausted"),
+                            )
                         stream_timeout_tokens = _facade()._push_stream_attempt_timeout_overrides(
-                            proxy._remaining_budget_seconds(deadline),
+                            remaining_attempt_budget,
                         )
                         try:
                             settlement = _StreamSettlement()
@@ -2533,12 +2553,6 @@ class _StreamingRetryMixin:
                                         outcome="owner_previsible_failure",
                                     )
                                     break
-                                await proxy._handle_stream_error(
-                                    account,
-                                    _upstream_error_from_openai(error),
-                                    code,
-                                    http_status=tex.status_code,
-                                )
                                 raise
                             error_payload: UpstreamError = (
                                 tex.error
@@ -2584,7 +2598,7 @@ class _StreamingRetryMixin:
                                     delay,
                                     error_code,
                                 )
-                                await scheduler.sleep(delay)
+                                await scheduler.sleep(min(delay, proxy._remaining_budget_seconds(deadline)))
                                 continue  # inner loop: retry same account
                             # Retry exhaustion or an admitted overload replacement:
                             # preserve the existing aggregate health/settlement path.
