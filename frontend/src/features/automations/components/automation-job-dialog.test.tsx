@@ -39,6 +39,152 @@ if (!HTMLElement.prototype.scrollIntoView) {
   });
 }
 
+const PRIMARY_ACCOUNT_HANDLER = http.get("/api/accounts", () =>
+  HttpResponse.json({
+    accounts: [
+      createAccountSummary({
+        accountId: "acc_primary",
+        email: "primary@example.com",
+        displayName: "Primary account",
+      }),
+    ],
+  }),
+);
+
+const GPT_54_MODELS: ModelItem[] = [
+  {
+    id: "gpt-5.4",
+    name: "GPT 5.4",
+    sourceOnly: false,
+    supportedReasoningEfforts: ["low", "medium", "high"],
+    defaultReasoningEffort: "medium",
+  },
+];
+
+function createScopedJob(overrides: Partial<AutomationJob> = {}): AutomationJob {
+  return {
+    id: "job_scoped",
+    name: "Scoped job",
+    enabled: true,
+    includePausedAccounts: false,
+    schedule: {
+      type: "daily",
+      time: "05:00",
+      timezone: "UTC",
+      thresholdMinutes: 0,
+      days: ["mon", "wed", "fri"],
+    },
+    model: "gpt-5.4",
+    reasoningEffort: "medium",
+    prompt: "ping",
+    accountScopeAll: false,
+    accountIds: ["acc_primary"],
+    nextRunAt: "2026-04-23T05:00:00Z",
+    lastRun: null,
+    ...overrides,
+  };
+}
+
+function renderEditDialog(editingJob: AutomationJob, onUpdate = vi.fn().mockResolvedValue(undefined)) {
+  renderWithProviders(
+    <AutomationJobDialog
+      open
+      busy={false}
+      editingJob={editingJob}
+      models={GPT_54_MODELS}
+      modelsLoading={false}
+      onOpenChange={vi.fn()}
+      onCreate={vi.fn().mockResolvedValue(undefined)}
+      onUpdate={onUpdate}
+    />,
+  );
+  return onUpdate;
+}
+
+const RUN_ON_ALL_ACCOUNTS = { name: "Run on all accounts" };
+
+describe("AutomationJobDialog orphaned account scope", () => {
+  it("keeps an orphaned scoped automation targetless when editing an unrelated field", async () => {
+    server.use(PRIMARY_ACCOUNT_HANDLER);
+    const user = userEvent.setup();
+    const onUpdate = renderEditDialog(createScopedJob({ accountIds: [] }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    });
+    expect(screen.getByRole("switch", RUN_ON_ALL_ACCOUNTS)).not.toBeChecked();
+
+    const nameInput = screen.getByLabelText("Name");
+    await user.clear(nameInput);
+    await user.type(nameInput, "Scoped job renamed");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => {
+      expect(onUpdate).toHaveBeenCalledTimes(1);
+    });
+    const [, payload] = onUpdate.mock.calls[0];
+    expect(payload).toMatchObject({ name: "Scoped job renamed" });
+    expect(payload).not.toHaveProperty("accountIds");
+  });
+
+  it("submits newly selected accounts for an orphaned scoped automation", async () => {
+    server.use(PRIMARY_ACCOUNT_HANDLER);
+    const user = userEvent.setup();
+    const onUpdate = renderEditDialog(createScopedJob({ accountIds: [] }));
+
+    const accountsTrigger = await screen.findByLabelText("Accounts");
+    await waitFor(() => expect(accountsTrigger).toBeEnabled());
+    expect(accountsTrigger).toHaveTextContent("All accounts");
+    await user.click(accountsTrigger);
+    await user.click(screen.getByRole("menuitemcheckbox", { name: /primary@example\.com/i }));
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("switch", RUN_ON_ALL_ACCOUNTS)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => {
+      expect(onUpdate).toHaveBeenCalledTimes(1);
+    });
+    expect(onUpdate.mock.calls[0][1].accountIds).toEqual(["acc_primary"]);
+  });
+
+  it("submits an empty account list only after explicitly opting an orphaned automation into all accounts", async () => {
+    server.use(PRIMARY_ACCOUNT_HANDLER);
+    const user = userEvent.setup();
+    const onUpdate = renderEditDialog(createScopedJob({ accountIds: [] }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+    });
+    await user.click(screen.getByRole("switch", RUN_ON_ALL_ACCOUNTS));
+    expect(screen.getByRole("switch", RUN_ON_ALL_ACCOUNTS)).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => {
+      expect(onUpdate).toHaveBeenCalledTimes(1);
+    });
+    expect(onUpdate.mock.calls[0][1].accountIds).toEqual([]);
+  });
+
+  it("still clears targets when a populated scoped automation is switched to all accounts", async () => {
+    server.use(PRIMARY_ACCOUNT_HANDLER);
+    const user = userEvent.setup();
+    const onUpdate = renderEditDialog(createScopedJob());
+
+    expect(screen.queryByRole("switch", RUN_ON_ALL_ACCOUNTS)).not.toBeInTheDocument();
+    const accountsTrigger = await screen.findByLabelText("Accounts");
+    await waitFor(() => expect(accountsTrigger).toHaveTextContent("1 account selected"));
+    await user.click(accountsTrigger);
+    await user.click(screen.getByRole("menuitemcheckbox", { name: "All accounts" }));
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => {
+      expect(onUpdate).toHaveBeenCalledTimes(1);
+    });
+    expect(onUpdate.mock.calls[0][1].accountIds).toEqual([]);
+  });
+});
+
 describe("AutomationJobDialog", () => {
   it("does not show fallback reasoning efforts when the selected model exposes an empty supported list", async () => {
     renderWithProviders(

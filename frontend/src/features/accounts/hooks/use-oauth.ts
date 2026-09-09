@@ -264,11 +264,16 @@ export function useOauth() {
   }, [clearCountdownTimer, clearPollTimer, queryClient, setOauthState]);
 
   const manualCallback = useCallback(async (callbackUrl: string) => {
+    const generation = generationRef.current;
+    const flowId = stateRef.current.flowId;
     try {
       const response = await submitManualOauthCallback({
         callbackUrl,
-        ...(stateRef.current.flowId ? { flowId: stateRef.current.flowId } : {}),
+        ...(flowId ? { flowId } : {}),
       });
+      if (generationRef.current !== generation || stateRef.current.flowId !== flowId) {
+        return response;
+      }
       setOauthState((prev) =>
         OAuthStateSchema.parse({
           ...prev,
@@ -286,6 +291,9 @@ export function useOauth() {
       }
       return response;
     } catch (error) {
+      if (generationRef.current !== generation || stateRef.current.flowId !== flowId) {
+        throw error;
+      }
       clearPollTimer();
       clearCountdownTimer();
       setOauthState((prev) =>

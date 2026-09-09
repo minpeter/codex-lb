@@ -573,6 +573,170 @@ describe("useOauth", () => {
     expect(result.current.state.errorMessage).toBeNull();
   });
 
+  it("ignores a stale flow A manual callback success and keeps flow B polling", async () => {
+    vi.useFakeTimers();
+    try {
+      const callbackA = createDeferred<{ status: string; errorMessage: null }>();
+      startOauthMock
+        .mockResolvedValueOnce({ ...browserOauthStart("flow-a"), intervalSeconds: 2 })
+        .mockResolvedValueOnce({ ...browserOauthStart("flow-b"), intervalSeconds: 2 });
+      submitManualOauthCallbackMock.mockImplementation(() => callbackA.promise);
+
+      const { queryClient, result } = renderUseOauth();
+      const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+      await act(async () => {
+        await result.current.start("browser");
+      });
+      expect(result.current.state.flowId).toBe("flow-a");
+
+      let callbackPromiseA: Promise<unknown> | undefined;
+      act(() => {
+        callbackPromiseA = result.current.manualCallback("http://localhost:1455/auth/callback?code=a&state=a");
+      });
+      if (callbackPromiseA === undefined) {
+        throw new Error("manual callback A did not start");
+      }
+      expect(submitManualOauthCallbackMock).toHaveBeenCalledWith({
+        callbackUrl: "http://localhost:1455/auth/callback?code=a&state=a",
+        flowId: "flow-a",
+      });
+
+      await act(async () => {
+        result.current.reset();
+        await result.current.start("browser");
+      });
+      expect(result.current.state.flowId).toBe("flow-b");
+      expect(result.current.state.status).toBe("pending");
+      expect(result.current.state.expiresInSeconds).toBe(600);
+
+      const pendingCallbackA = callbackPromiseA;
+      await act(async () => {
+        callbackA.resolve({ status: "success", errorMessage: null });
+        await pendingCallbackA;
+      });
+
+      expect(result.current.state.flowId).toBe("flow-b");
+      expect(result.current.state.status).toBe("pending");
+      expect(result.current.state.errorMessage).toBeNull();
+      expect(invalidateSpy).not.toHaveBeenCalled();
+
+      await act(async () => {
+        vi.advanceTimersByTime(2_000);
+      });
+      expect(getOauthStatusMock).toHaveBeenCalledWith("flow-b");
+      expect(getOauthStatusMock).not.toHaveBeenCalledWith("flow-a");
+      expect(result.current.state.expiresInSeconds).toBe(598);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores a stale flow A manual callback failure and keeps flow B polling", async () => {
+    vi.useFakeTimers();
+    try {
+      const callbackA = createDeferred<{ status: string; errorMessage: string | null }>();
+      startOauthMock
+        .mockResolvedValueOnce({ ...browserOauthStart("flow-a"), intervalSeconds: 2 })
+        .mockResolvedValueOnce({ ...browserOauthStart("flow-b"), intervalSeconds: 2 });
+      submitManualOauthCallbackMock.mockImplementation(() => callbackA.promise);
+
+      const { result } = renderUseOauth();
+
+      await act(async () => {
+        await result.current.start("browser");
+      });
+      expect(result.current.state.flowId).toBe("flow-a");
+
+      let callbackPromiseA: Promise<unknown> | undefined;
+      act(() => {
+        callbackPromiseA = result.current.manualCallback("http://localhost:1455/auth/callback?code=a&state=a");
+      });
+      if (callbackPromiseA === undefined) {
+        throw new Error("manual callback A did not start");
+      }
+
+      await act(async () => {
+        result.current.reset();
+        await result.current.start("browser");
+      });
+      expect(result.current.state.flowId).toBe("flow-b");
+      expect(result.current.state.status).toBe("pending");
+
+      const pendingCallbackA = callbackPromiseA;
+      let callbackAError: unknown;
+      await act(async () => {
+        callbackA.reject(new Error("stale callback A failed"));
+        callbackAError = await pendingCallbackA.then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+      });
+      expect(callbackAError).toBeInstanceOf(Error);
+
+      expect(result.current.state.flowId).toBe("flow-b");
+      expect(result.current.state.status).toBe("pending");
+      expect(result.current.state.errorMessage).toBeNull();
+
+      await act(async () => {
+        vi.advanceTimersByTime(2_000);
+      });
+      expect(getOauthStatusMock).toHaveBeenCalledWith("flow-b");
+      expect(result.current.state.expiresInSeconds).toBe(598);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores a stale flow A manual callback error response and keeps flow B polling", async () => {
+    vi.useFakeTimers();
+    try {
+      const callbackA = createDeferred<{ status: string; errorMessage: string | null }>();
+      startOauthMock
+        .mockResolvedValueOnce({ ...browserOauthStart("flow-a"), intervalSeconds: 2 })
+        .mockResolvedValueOnce({ ...browserOauthStart("flow-b"), intervalSeconds: 2 });
+      submitManualOauthCallbackMock.mockImplementation(() => callbackA.promise);
+
+      const { result } = renderUseOauth();
+
+      await act(async () => {
+        await result.current.start("browser");
+      });
+
+      let callbackPromiseA: Promise<unknown> | undefined;
+      act(() => {
+        callbackPromiseA = result.current.manualCallback("http://localhost:1455/auth/callback?code=a&state=a");
+      });
+      if (callbackPromiseA === undefined) {
+        throw new Error("manual callback A did not start");
+      }
+
+      await act(async () => {
+        result.current.reset();
+        await result.current.start("browser");
+      });
+      expect(result.current.state.flowId).toBe("flow-b");
+
+      const pendingCallbackA = callbackPromiseA;
+      await act(async () => {
+        callbackA.resolve({ status: "error", errorMessage: "Invalid OAuth callback: state mismatch or missing code." });
+        await pendingCallbackA;
+      });
+
+      expect(result.current.state.flowId).toBe("flow-b");
+      expect(result.current.state.status).toBe("pending");
+      expect(result.current.state.errorMessage).toBeNull();
+
+      await act(async () => {
+        vi.advanceTimersByTime(2_000);
+      });
+      expect(getOauthStatusMock).toHaveBeenCalledWith("flow-b");
+      expect(result.current.state.expiresInSeconds).toBe(598);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not apply a stale start success onto flow B after restart", async () => {
     const startA = createDeferred<ReturnType<typeof browserOauthStart>>();
     startOauthMock

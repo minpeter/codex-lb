@@ -95,6 +95,7 @@ type ApiKeyEditDraft = {
   selectedAccountIds: string[];
   selectedSourceIds: string[];
   selectedReasoningEfforts: ReasoningEffortType[];
+  clearAccountScope: boolean;
   clearSourceScope: boolean;
   usageSections: string;
   limitRules: LimitRuleCreate[];
@@ -113,6 +114,7 @@ function createApiKeyEditDraft(apiKey: ApiKey): ApiKeyEditDraft {
     selectedAccountIds: apiKey.assignedAccountIds,
     selectedSourceIds: apiKey.assignedSourceIds,
     selectedReasoningEfforts: apiKey.allowedReasoningEfforts || [],
+    clearAccountScope: false,
     clearSourceScope: false,
     usageSections: apiKey.usageSections,
     limitRules: limitsToCreateRules(apiKey),
@@ -153,14 +155,14 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
 
   const handleSubmit = async (values: FormValues) => {
     const normalizedLimits = normalizeLimitRules(draft.limitRules);
-    const shouldSubmitAssignedAccountIds =
-      hasSelectionChange(apiKey.assignedAccountIds, draft.selectedAccountIds) ||
-      (apiKey.accountAssignmentScopeEnabled && draft.selectedAccountIds.length === 0);
-    // A source-scoped key whose assigned sources were all deleted comes back
+    // A scoped key whose assigned accounts/sources were all deleted comes back
     // as scopeEnabled=true with an empty id list (deny-all). Submitting an
     // empty list would make the backend disable scoping and silently broaden
-    // the key to every source, so an empty->empty selection is only sent when
-    // the user explicitly opts to remove the restriction.
+    // the key to every account/source, so an empty->empty selection is only
+    // sent when the user explicitly opts to remove the restriction.
+    const shouldSubmitAssignedAccountIds =
+      hasSelectionChange(apiKey.assignedAccountIds, draft.selectedAccountIds) ||
+      (apiKey.accountAssignmentScopeEnabled && draft.selectedAccountIds.length === 0 && draft.clearAccountScope);
     const shouldSubmitAssignedSourceIds =
       hasSelectionChange(apiKey.assignedSourceIds, draft.selectedSourceIds) ||
       (apiKey.sourceAssignmentScopeEnabled && draft.selectedSourceIds.length === 0 && draft.clearSourceScope);
@@ -240,6 +242,25 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
             <div className="space-y-1">
               <div className="text-sm font-medium">{t("apiKeys.form.assignedAccounts")}</div>
               <AccountMultiSelect value={draft.selectedAccountIds} onChange={(selectedAccountIds) => updateDraft({ selectedAccountIds })} />
+              {apiKey.accountAssignmentScopeEnabled &&
+              apiKey.assignedAccountIds.length === 0 &&
+              draft.selectedAccountIds.length === 0 ? (
+                <div className="space-y-1 rounded-md border border-destructive/50 p-2 text-xs">
+                  <p className="text-muted-foreground">
+                    {t("apiKeys.form.missingAccountRestriction")}
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="edit-api-key-clear-account-scope"
+                      checked={draft.clearAccountScope}
+                      onCheckedChange={(checked) => updateDraft({ clearAccountScope: checked === true })}
+                    />
+                    <label htmlFor="edit-api-key-clear-account-scope" className="cursor-pointer">
+                      {t("apiKeys.form.removeAccountRestriction")}
+                    </label>
+                  </div>
+                </div>
+              ) : null}
             </div>
 
             <div className="space-y-1">

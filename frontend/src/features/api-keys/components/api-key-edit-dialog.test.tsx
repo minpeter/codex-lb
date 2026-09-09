@@ -359,7 +359,7 @@ describe("ApiKeyEditDialog", () => {
     expect(payload.assignedAccountIds).toEqual([]);
   });
 
-  it("submits an empty assigned account list when a scoped key loses its assigned accounts", async () => {
+  it("keeps a deny-all account scope when editing an unrelated field", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);
 
@@ -387,7 +387,84 @@ describe("ApiKeyEditDialog", () => {
 
     const payload = onSubmit.mock.calls[0][0];
     expect(payload.name).toBe("Renamed key");
-    expect(payload.assignedAccountIds).toEqual([]);
+    expect("assignedAccountIds" in payload).toBe(false);
+  });
+
+  it("submits an empty account list when explicitly removing a deny-all account scope", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={createApiKey({
+          accountAssignmentScopeEnabled: true,
+          assignedAccountIds: [],
+        })}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("checkbox", { name: "Remove account restriction (allow all accounts)" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    expect(onSubmit.mock.calls[0][0].assignedAccountIds).toEqual([]);
+  });
+
+  it("submits newly selected accounts for a deny-all account scope", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={createApiKey({
+          accountAssignmentScopeEnabled: true,
+          assignedAccountIds: [],
+        })}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "All accounts" }));
+    await user.click(screen.getByRole("menuitemcheckbox", { name: /primary@example\.com/i }));
+    await user.keyboard("{Escape}");
+    expect(
+      screen.queryByRole("checkbox", { name: "Remove account restriction (allow all accounts)" }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    expect(onSubmit.mock.calls[0][0].assignedAccountIds).toEqual(["acc_primary"]);
+  });
+
+  it("does not offer account scope removal for an unscoped key", () => {
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={createApiKey({ accountAssignmentScopeEnabled: false, assignedAccountIds: [] })}
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("checkbox", { name: "Remove account restriction (allow all accounts)" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps a deny-all source scope when editing an unrelated field", async () => {

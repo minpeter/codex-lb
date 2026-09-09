@@ -73,13 +73,14 @@ type CreateFormField = "name" | "model" | "time" | "threshold" | "accounts";
 type CreateFormErrors = Partial<Record<CreateFormField, string>>;
 
 const FORM_FIELD_IDS: Record<
-  CreateFormField | "type" | "timezone" | "days" | "prompt" | "reasoning" | "includePaused",
+  CreateFormField | "type" | "timezone" | "days" | "prompt" | "reasoning" | "includePaused" | "runOnAllAccounts",
   string
 > = {
   name: "automation-name",
   model: "automation-model",
   reasoning: "automation-reasoning",
   includePaused: "automation-include-paused",
+  runOnAllAccounts: "automation-run-on-all-accounts",
   time: "automation-time",
   threshold: "automation-threshold",
   accounts: "automation-accounts",
@@ -266,6 +267,14 @@ function AutomationJobDialogForm({
   const [promptDefaultValue] = useState(editingJob?.prompt ?? "ping");
   const promptInputVersion = 0;
   const [accountIds, setAccountIds] = useState<string[]>(() => [...(editingJob?.accountIds ?? [])]);
+  // A scoped job whose assigned accounts were all deleted comes back as
+  // accountScopeAll=false with an empty id list (runs on no accounts). The
+  // multi-select shows an empty selection as "All accounts", and submitting an
+  // empty list would make the backend flip the job to every account, so an
+  // empty->empty selection is only sent when the user explicitly opts in.
+  const orphanedAccountScope =
+    editingJob !== null && !(editingJob.accountScopeAll ?? editingJob.accountIds.length === 0) && editingJob.accountIds.length === 0;
+  const [runOnAllAccounts, setRunOnAllAccounts] = useState(false);
   const nameRef = useRef<HTMLInputElement | null>(null);
   const timeRef = useRef<HTMLInputElement | null>(null);
   const thresholdRef = useRef<HTMLInputElement | null>(null);
@@ -416,11 +425,11 @@ function AutomationJobDialogForm({
       if (editingJob) {
         const nextAccountScopeAll = accountIds.length === 0;
         const currentAccountScopeAll = editingJob.accountScopeAll ?? editingJob.accountIds.length === 0;
-        const targetPatch =
-          automationAccountTargetsChanged(editingJob.accountIds, accountIds) ||
-          currentAccountScopeAll !== nextAccountScopeAll
-            ? { accountIds }
-            : {};
+        const shouldSubmitTargets = orphanedAccountScope
+          ? accountIds.length > 0 || runOnAllAccounts
+          : automationAccountTargetsChanged(editingJob.accountIds, accountIds) ||
+            currentAccountScopeAll !== nextAccountScopeAll;
+        const targetPatch = shouldSubmitTargets ? { accountIds } : {};
         const updatePayload: AutomationUpdateRequest =
           reasoningEffortTouched ||
           shouldPersistReasoningEffortOnUpdate ||
@@ -754,6 +763,24 @@ function AutomationJobDialogForm({
                   />
                   {showFieldError("accounts") ? (
                     <p id={`${FORM_FIELD_IDS.accounts}-error`} className="text-xs text-destructive">{showFieldError("accounts")}</p>
+                  ) : null}
+                  {orphanedAccountScope && accountIds.length === 0 ? (
+                    <div className="border-destructive/50 flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
+                      <div className="space-y-0.5">
+                        <label htmlFor={FORM_FIELD_IDS.runOnAllAccounts} className="text-sm font-medium">
+                          {t("automations.dialog.removeAccountRestriction")}
+                        </label>
+                        <p className="text-xs text-muted-foreground">
+                          {t("automations.dialog.missingAccountRestriction")}
+                        </p>
+                      </div>
+                      <Switch
+                        id={FORM_FIELD_IDS.runOnAllAccounts}
+                        checked={runOnAllAccounts}
+                        onCheckedChange={setRunOnAllAccounts}
+                        aria-label={t("automations.dialog.removeAccountRestriction")}
+                      />
+                    </div>
                   ) : null}
                 </div>
               </div>
