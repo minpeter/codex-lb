@@ -438,10 +438,7 @@ class _HTTPBridgeMixin(
         original_request_unanchored = _http_bridge_request_needs_unanchored_handoff(
             key, incoming_turn_state, previous_response_id, forwarded_request, forwarded_original_request_unanchored
         )
-        # Model-transition isolation intentionally drops the durable lookup as a
-        # routing input below. Preserve generation provenance first: the same
-        # replica id can still name an older socket/process whose late release
-        # must be fenced by a newly advanced owner epoch.
+        # Preserve predecessor generation so an older process cannot release its successor.
         same_replica_durable_predecessor = bool(
             durable_lookup and durable_lookup.owner_instance_id == settings.http_responses_session_bridge_instance_id
         )
@@ -450,8 +447,7 @@ class _HTTPBridgeMixin(
         )
         if model_transition_rebind:
             durable_lookup = None
-        # Account selection consumes this one-shot capability; canonical creation
-        # also forces takeover so a prior-ring durable owner cannot reject it.
+        # One-shot reselection also forces takeover from a prior-ring owner.
         force_goal_restart_account_reselection = affinity.abandon_unavailable_legacy_owner
         if await _http_bridge_should_wait_for_registration(self, key, settings):
             skip_registration_gate = False
@@ -592,8 +588,9 @@ class _HTTPBridgeMixin(
                                 continue
                             else:
                                 key = _HTTPBridgeSessionKey("turn_state_header", incoming_turn_state, api_key_id)
-                        elif not _http_bridge_compatible(
-                            alias_session, request_model, request_service_tier, True
+                        elif (
+                            not _http_bridge_compatible(alias_session, request_model, request_service_tier, True)
+                            or (exclude_account_ids and alias_session.account.id in exclude_account_ids)
                         ) or not _http_bridge_session_matches_preferred_account(
                             session=alias_session,
                             previous_response_id=previous_response_id,
@@ -624,6 +621,7 @@ class _HTTPBridgeMixin(
                                 and (not previous_session.closed or previous_session.handoff_in_progress)
                                 and _http_bridge_session_account_active(previous_session)
                                 and _http_bridge_compatible(previous_session, request_model, request_service_tier, True)
+                                and (not exclude_account_ids or previous_session.account.id not in exclude_account_ids)
                                 and _http_bridge_session_matches_preferred_account(
                                     session=previous_session,
                                     previous_response_id=previous_response_id,
@@ -692,6 +690,17 @@ class _HTTPBridgeMixin(
                         force_durable_takeover = True
                     self._schedule_http_bridge_session_closes(pruned_sessions, reason="registry_detach")
                 existing = self._http_bridge_sessions.get(key)
+                if existing is not None and exclude_account_ids and existing.account.id in exclude_account_ids:
+                    _require_http_bridge_bound_account_not_excluded(
+                        key.strength == "hard" or require_preferred_account or previous_response_id is not None
+                        or incoming_turn_state is not None, existing.account.id, set(exclude_account_ids)
+                    )
+                    key = _HTTPBridgeSessionKey(
+                        "internal_soft_affinity_reroute", f"{key.affinity_kind}:{uuid4().hex}",
+                        key.api_key_id, strength="soft",
+                    )
+                    durable_lookup = None
+                    continue
                 retained_handoff = bool(
                     existing and existing.closed and _http_bridge_session_has_admission_waiter(existing)
                 )
@@ -1296,12 +1305,7 @@ class _HTTPBridgeMixin(
                                 owner_check_applied=owner_check_required,
                             )
                     elif session_to_return_after_close is None and inflight_future is None and owner_forward is None:
-                        # Owner forwards never resolve a local inflight reservation; skip admission.
-                        # Detached generations remain globally capacity-owned
-                        # until close finalization. This request may discount
-                        # only the idle generations it has committed to close
-                        # synchronously below, before its inflight reservation
-                        # can create a replacement socket.
+                        # Only committed synchronous idle closes can discount owned capacity.
                         _plan_http_bridge_lru_capacity_closes(
                             self,
                             max_sessions=max_sessions,
@@ -1325,12 +1329,8 @@ class _HTTPBridgeMixin(
                                 )
                                 if not sessions_to_close_before_create:
                                     raise capacity_error
-                                # Detachment already transferred these LRU
-                                # generations out of the canonical registry.
-                                # Give each one a bounded-close owner before
-                                # rejecting admission; otherwise this early 429
-                                # leaves its live socket and leases stranded in
-                                # the detached registry until unrelated cleanup.
+                                # Detached LRU sessions need bounded-close owners before
+                                # this 429, or their sockets and leases remain stranded.
                                 capacity_error_after_planned_closes = capacity_error
                         else:
                             inflight_future = asyncio.get_running_loop().create_future()
@@ -1441,6 +1441,17 @@ class _HTTPBridgeMixin(
                         fork_key, forwarded_request, forwarded_original_request_unanchored
                     )
                     continue
+                if exclude_account_ids and session.account.id in exclude_account_ids:
+                    _require_http_bridge_bound_account_not_excluded(
+                        key.strength == "hard" or require_preferred_account or previous_response_id is not None
+                        or incoming_turn_state is not None, session.account.id, set(exclude_account_ids)
+                    )
+                    key = _HTTPBridgeSessionKey(
+                        "internal_soft_affinity_reroute", f"{key.affinity_kind}:{uuid4().hex}",
+                        key.api_key_id, strength="soft",
+                    )
+                    durable_lookup = None
+                    continue
                 if (
                     not force_goal_restart_account_reselection
                     and not session.closed
@@ -1546,11 +1557,8 @@ class _HTTPBridgeMixin(
                 }
                 restart_takeover = durable_lookup is not None and _http_bridge_allow_durable_takeover(durable_lookup)
                 if restart_takeover:
-                    # restart_takeover means recovering a row whose previous
-                    # owner is genuinely gone. Every claim now advances the
-                    # epoch, so epoch > 1 alone would also count ordinary
-                    # local successor claims (no pre-claim lookup, or a
-                    # forced replace of a live local session).
+                    # Only a gone predecessor is a restart takeover; epoch > 1
+                    # also includes ordinary same-process replacement claims.
                     claim_kwargs["record_restart_takeover"] = True
                 await self._claim_durable_http_bridge_session(created_session, **claim_kwargs)
                 async with self._http_bridge_lock:

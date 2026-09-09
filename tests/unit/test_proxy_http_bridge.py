@@ -9655,6 +9655,64 @@ async def test_http_bridge_capacity_wait_with_response_id_sends_explicit_keepali
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lookup", ["cached", "inflight", "hard_owner"])
+async def test_get_or_create_http_bridge_session_does_not_reuse_excluded_account(
+    monkeypatch: pytest.MonkeyPatch,
+    lookup: str,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey(
+        "prompt_cache_key", "excluded-key", None, strength="hard" if lookup == "hard_owner" else "soft"
+    )
+    existing = proxy_service._HTTPBridgeSession(
+        key=key, headers={}, affinity=proxy_service._AffinityPolicy(key="excluded-key"),
+        request_model="gpt-5.4",
+        account=cast(Any, SimpleNamespace(id="acc-excluded", status=AccountStatus.ACTIVE, plan_type="plus")),
+        upstream=cast(Any, SimpleNamespace()), upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque(), pending_lock=anyio.Lock(), response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=0, last_used_at=1.0, idle_ttl_seconds=120.0,
+    )
+    if lookup == "inflight":
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(existing)
+        service._http_bridge_inflight_sessions[key] = future
+    else:
+        service._http_bridge_sessions[key] = existing
+    turn_alias = ("other-turn", None)
+    response_alias = ("other-response", None)
+    service._http_bridge_turn_state_index[turn_alias] = key
+    service._http_bridge_previous_response_index[response_alias] = key
+    replacement = replace(existing, account=cast(Any, SimpleNamespace(id="acc-fresh", status=AccountStatus.ACTIVE)))
+    monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", Mock(return_value=[]))
+    monkeypatch.setattr(service, "_create_http_bridge_session", AsyncMock(return_value=replacement))
+    monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(proxy_service, "_http_bridge_owner_instance", AsyncMock(return_value="instance-a"))
+    monkeypatch.setattr(
+        proxy_service,
+        "_active_http_bridge_instance_ring",
+        AsyncMock(return_value=("instance-a", ("instance-a",))),
+    )
+    async def resolve():
+        return await service._get_or_create_http_bridge_session(
+            key, headers={}, affinity=proxy_service._AffinityPolicy(key="excluded-key"), api_key=None,
+            request_model="gpt-5.4", idle_ttl_seconds=120.0, max_sessions=8,
+            exclude_account_ids={"acc-excluded"},
+        )
+
+    if lookup == "hard_owner":
+        with pytest.raises(ProxyResponseError):
+            await resolve()
+    else:
+        assert await resolve() is replacement
+    if lookup != "inflight":
+        assert service._http_bridge_sessions[key] is existing
+    assert not existing.closed
+    assert service._http_bridge_turn_state_index[turn_alias] == key
+    assert service._http_bridge_previous_response_index[response_alias] == key
+
+
+@pytest.mark.asyncio
 async def test_get_or_create_http_bridge_session_reuses_live_local_session_without_ring_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
