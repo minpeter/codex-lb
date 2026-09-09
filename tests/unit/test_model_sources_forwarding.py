@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack
+from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 
 from app.core.crypto import TokenEncryptor
 from app.core.types import JsonValue
 from app.db.models import ModelSource
+from app.modules.model_sources import forwarding
 from app.modules.model_sources.forwarding import (
     SourceStreamUsageParser,
     SourceUsageHolder,
     _audio_seconds_from_body,
+    _await_cleanup_deferring_cancellation,
     _error_payload_from_body,
     _redact_source_error_payload,
     _timings_from_audio_body,
@@ -18,6 +25,110 @@ from app.modules.model_sources.forwarding import (
     _timings_from_payload,
     _usage_from_audio_body,
 )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_defers_cancellation_until_owned_close_finishes() -> None:
+    closed = False
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def close() -> None:
+        nonlocal closed
+        started.set()
+        await release.wait()
+        closed = True
+
+    task = asyncio.create_task(_await_cleanup_deferring_cancellation(close()))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    release.set()
+    await asyncio.wait_for(task, 2)
+    assert closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_shape", ["chat", "responses"])
+@pytest.mark.parametrize("started", [False, True])
+async def test_source_body_close_owns_eager_stack(
+    monkeypatch: pytest.MonkeyPatch, response_shape: str, started: bool
+) -> None:
+    stack = AsyncExitStack()
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    async def close() -> None:
+        close_started.set()
+        await allow_close.wait()
+        close_finished.set()
+
+    close_mock = AsyncMock(side_effect=close)
+    stack.push_async_callback(close_mock)
+    chunk = b'data: {"usage":{"prompt_tokens":2,"completion_tokens":1,"input_tokens":2,"output_tokens":1}}\n\n'
+
+    async def chunks() -> AsyncGenerator[bytes]:
+        yield chunk
+
+    upstream = chunks()
+    response = SimpleNamespace(status=200, content=SimpleNamespace(iter_chunked=lambda size: upstream))
+    monkeypatch.setattr(forwarding, "_open_source_stream", AsyncMock(return_value=(stack, response)))
+    source = ModelSource(id="unit-source", base_url="http://source.invalid/v1")
+    stream_fn = forwarding.stream_responses if response_shape == "responses" else forwarding.stream_chat_completion
+    stream = await stream_fn(source, {"model": "unit-model"})
+    if started:
+        assert await anext(stream.body) == chunk
+        assert stream.usage_holder.usage == forwarding.SourceUsage(input_tokens=2, output_tokens=1)
+    else:
+        assert stream.usage_holder.usage is None
+    close_body = getattr(stream.body, "aclose")
+    task = asyncio.create_task(close_body())
+    try:
+        await asyncio.wait_for(close_started.wait(), 2)
+        task.cancel()
+        allow_close.set()
+        await asyncio.wait_for(task, 2)
+        assert close_finished.is_set()
+        await close_body()
+        close_mock.assert_awaited_once_with()
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream.body)
+    finally:
+        allow_close.set()
+        await asyncio.wait_for(task, 2)
+        await upstream.aclose()
+        await stack.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_shape", ["chat", "responses"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_source_body_terminal_read_closes_stack(
+    monkeypatch: pytest.MonkeyPatch, response_shape: str, fails: bool
+) -> None:
+    stack = AsyncExitStack()
+    close = AsyncMock()
+    stack.push_async_callback(close)
+
+    async def chunks() -> AsyncGenerator[bytes]:
+        yield b"data: chunk\n\n"
+        if fails:
+            raise RuntimeError("upstream read failed")
+
+    upstream = chunks()
+    response = SimpleNamespace(status=200, content=SimpleNamespace(iter_chunked=lambda size: upstream))
+    monkeypatch.setattr(forwarding, "_open_source_stream", AsyncMock(return_value=(stack, response)))
+    source = ModelSource(id="unit-source", base_url="http://source.invalid/v1")
+    stream_fn = forwarding.stream_responses if response_shape == "responses" else forwarding.stream_chat_completion
+    stream = await stream_fn(source, {"model": "unit-model"})
+    try:
+        assert await anext(stream.body) == b"data: chunk\n\n"
+        with pytest.raises(RuntimeError if fails else StopAsyncIteration):
+            await anext(stream.body)
+        close.assert_awaited_once_with()
+    finally:
+        await upstream.aclose()
+        await stack.aclose()
 
 
 class _FakeEncryptor:

@@ -7,7 +7,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from json import JSONDecodeError
 from math import isfinite
-from typing import cast
+from typing import cast, override
 
 import aiohttp
 
@@ -124,6 +124,40 @@ async def _await_result_deferring_cancellation(awaitable: Awaitable[object]) -> 
     return await _shared_await_cleanup_deferring_cancellation(awaitable) is not None
 
 
+class _OwnedSourceStream(AsyncIterator[bytes]):
+    """Own the eager HTTP stack even before the first body read."""
+
+    def __init__(
+        self, stack: AsyncExitStack, response: aiohttp.ClientResponse, usage_parser: SourceStreamUsageParser
+    ) -> None:
+        self._stack: AsyncExitStack = stack
+        self._response: aiohttp.ClientResponse = response
+        self._usage_parser: SourceStreamUsageParser = usage_parser
+        self._iterator: AsyncIterator[bytes] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+
+    @override
+    async def __anext__(self) -> bytes:
+        if self._close_task is not None:
+            raise StopAsyncIteration
+        try:
+            if self._iterator is None:
+                self._iterator = self._response.content.iter_chunked(4096)
+            chunk = await anext(self._iterator)
+            self._usage_parser.feed(chunk)
+            return chunk
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        # A shared task makes every close await the same unwind. Shielding
+        # also prevents repeated cancellation from interrupting a lease exit.
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._stack.aclose())
+        await _await_cleanup_deferring_cancellation(self._close_task)
+
+
 async def forward_chat_completion(
     source: ModelSource,
     payload: dict[str, JsonValue],
@@ -184,18 +218,11 @@ async def stream_chat_completion(
     usage_parser = SourceStreamUsageParser(usage_holder, response_shape="chat")
     stack, response = await _open_source_stream(source, "/chat/completions", payload, encryptor=encryptor)
 
-    async def body() -> AsyncIterator[bytes]:
-        try:
-            async for chunk in response.content.iter_chunked(4096):
-                usage_parser.feed(chunk)
-                yield chunk
-        finally:
-            # A plain ``async with stack`` unwinds unshielded: repeated
-            # cancellation delivery can interrupt ``__aexit__`` mid-unwind and
-            # leak the pooled HTTP session lease.
-            await _await_cleanup_deferring_cancellation(stack.aclose())
-
-    return SourceChatStream(body=body(), usage_holder=usage_holder, upstream_status_code=response.status)
+    return SourceChatStream(
+        body=_OwnedSourceStream(stack, response, usage_parser),
+        usage_holder=usage_holder,
+        upstream_status_code=response.status,
+    )
 
 
 async def forward_responses(
@@ -336,18 +363,11 @@ async def stream_responses(
     usage_parser = SourceStreamUsageParser(usage_holder, response_shape="responses")
     stack, response = await _open_source_stream(source, "/responses", payload, encryptor=encryptor)
 
-    async def body() -> AsyncIterator[bytes]:
-        try:
-            async for chunk in response.content.iter_chunked(4096):
-                usage_parser.feed(chunk)
-                yield chunk
-        finally:
-            # A plain ``async with stack`` unwinds unshielded: repeated
-            # cancellation delivery can interrupt ``__aexit__`` mid-unwind and
-            # leak the pooled HTTP session lease.
-            await _await_cleanup_deferring_cancellation(stack.aclose())
-
-    return SourceResponsesStream(body=body(), usage_holder=usage_holder, upstream_status_code=response.status)
+    return SourceResponsesStream(
+        body=_OwnedSourceStream(stack, response, usage_parser),
+        usage_holder=usage_holder,
+        upstream_status_code=response.status,
+    )
 
 
 async def _open_source_stream(

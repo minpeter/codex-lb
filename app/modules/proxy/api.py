@@ -5024,6 +5024,9 @@ async def _source_responses_response(
     if payload.stream:
         try:
             stream = await stream_source_responses(source, source_payload)
+        except asyncio.CancelledError:
+            await _shared_await_cleanup_deferring_cancellation(_release_reservation(reservation))
+            raise
         except ModelSourceForwardingError as exc:
             await _release_reservation(reservation)
             await _log_source_chat_completion(
@@ -5091,6 +5094,9 @@ async def _source_responses_response(
 
     try:
         result = await forward_source_responses(source, source_payload)
+    except asyncio.CancelledError:
+        await _shared_await_cleanup_deferring_cancellation(_release_reservation(reservation))
+        raise
     except ModelSourceForwardingError as exc:
         await _release_reservation(reservation)
         await _log_source_chat_completion(
@@ -7893,7 +7899,9 @@ async def _prepend_initial_sse_heartbeat(
         async for line in stream:
             yield line
     finally:
-        await _close_responses_stream_best_effort(stream, action="initial heartbeat")
+        await _shared_await_cleanup_deferring_cancellation(
+            _close_responses_stream_best_effort(stream, action="initial heartbeat")
+        )
 
 
 def _record_stream_keepalive(surface: str) -> None:
