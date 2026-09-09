@@ -58,6 +58,7 @@ from app.modules.dashboard_auth.service import (
     TotpInvalidCodeError,
     TotpInvalidSetupError,
     TotpNotConfiguredError,
+    _hash_totp_secret,
     get_dashboard_session_store,
     get_guest_password_rate_limiter,
     get_password_rate_limiter,
@@ -93,6 +94,8 @@ async def _create_dashboard_session(
         ttl_seconds=ttl_seconds,
         role=role,
         guest_verified=guest_verified,
+        password_hash=settings.password_hash if password_verified else None,
+        guest_password_hash=settings.guest_password_hash if guest_verified else None,
     )
     return session_id, ttl_seconds
 
@@ -178,7 +181,7 @@ async def _has_active_password_session(request: Request, context: DashboardAuthC
     if settings.password_hash is None:
         return False
     session_id = request.cookies.get(DASHBOARD_SESSION_COOKIE)
-    return get_dashboard_session_store().is_password_verified(session_id)
+    return get_dashboard_session_store().is_password_verified(session_id, settings.password_hash)
 
 
 async def _validate_password_management_session(request: Request) -> None:
@@ -186,10 +189,20 @@ async def _validate_password_management_session(request: Request) -> None:
 
     session_id = request.cookies.get(DASHBOARD_SESSION_COOKIE)
     session_state = get_dashboard_session_store().get(session_id)
-    if session_state is None or session_state.role != DashboardRole.ADMIN or not session_state.password_verified:
+    settings = await get_settings_cache().get()
+    if (
+        session_state is None
+        or session_state.role != DashboardRole.ADMIN
+        or not session_state.password_verified
+        or session_state.password_hash != settings.password_hash
+        or (
+            session_state.totp_verified
+            and session_state.totp_secret_hash != _hash_totp_secret(settings.totp_secret_encrypted)
+        )
+    ):
         raise DashboardAuthError("Authentication is required")
 
-    settings = await get_settings_cache().get()
+
     if settings.totp_required_on_login and not session_state.totp_verified:
         raise DashboardAuthError(
             "TOTP verification is required for dashboard access",

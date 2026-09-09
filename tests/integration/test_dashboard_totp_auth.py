@@ -5,6 +5,8 @@ import asyncio
 import pyotp
 import pytest
 
+from app.db.session import SessionLocal
+from app.modules.dashboard_auth.repository import DashboardAuthRepository
 from app.modules.dashboard_auth.service import DASHBOARD_SESSION_COOKIE, get_dashboard_session_store
 
 pytestmark = pytest.mark.integration
@@ -285,8 +287,13 @@ async def test_disable_totp_requires_existing_totp_configuration(async_client):
     )
     assert setup_password.status_code == 200
 
+    async with SessionLocal() as session:
+        settings = await DashboardAuthRepository(session).get_settings()
     session_id = get_dashboard_session_store().create(
-        password_verified=True, totp_verified=True, ttl_seconds=12 * 60 * 60
+        password_verified=True,
+        totp_verified=True,
+        ttl_seconds=12 * 60 * 60,
+        password_hash=settings.password_hash,
     )
     async_client.cookies.set(DASHBOARD_SESSION_COOKIE, session_id)
 

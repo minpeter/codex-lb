@@ -34,7 +34,11 @@ from app.db.session import get_background_session
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyData, ApiKeyInvalidError, ApiKeysService
-from app.modules.dashboard_auth.service import DASHBOARD_SESSION_COOKIE, get_dashboard_session_store
+from app.modules.dashboard_auth.service import (
+    DASHBOARD_SESSION_COOKIE,
+    _hash_totp_secret,
+    get_dashboard_session_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +193,12 @@ async def validate_dashboard_session(request: Request) -> DashboardPrincipal:
     state = get_dashboard_session_store().get(session_id)
 
     has_admin_fallback_session = (
-        state is not None and state.role == DashboardRole.ADMIN and password_required and state.password_verified
+        state is not None
+        and state.role == DashboardRole.ADMIN
+        and password_required
+        and state.password_verified
+        and state.password_hash == settings.password_hash
+        and (not state.totp_verified or state.totp_secret_hash == _hash_totp_secret(settings.totp_secret_encrypted))
     )
     if get_dashboard_request_auth_mode() == DashboardAuthMode.TRUSTED_HEADER and not has_admin_fallback_session:
         raise DashboardAuthError("Reverse proxy authentication is required", code="proxy_auth_required")
@@ -197,10 +206,20 @@ async def validate_dashboard_session(request: Request) -> DashboardPrincipal:
         state is not None
         and state.role == DashboardRole.GUEST
         and guest_access_enabled
-        and ((not guest_password_required and passwordless_guest_fallback_allowed) or state.guest_verified)
+        and (
+            (not guest_password_required and passwordless_guest_fallback_allowed)
+            or (state.guest_verified and state.guest_password_hash == settings.guest_password_hash)
+        )
     ):
         return _set_dashboard_principal(request, guest_principal())
-    if state is not None and state.role == DashboardRole.ADMIN and password_required and state.password_verified:
+    if (
+        state is not None
+        and state.role == DashboardRole.ADMIN
+        and password_required
+        and state.password_verified
+        and state.password_hash == settings.password_hash
+        and (not state.totp_verified or state.totp_secret_hash == _hash_totp_secret(settings.totp_secret_encrypted))
+    ):
         if settings.totp_required_on_login and not state.totp_verified:
             raise DashboardAuthError("TOTP verification is required for dashboard access", code="totp_required")
         return _set_dashboard_principal(
@@ -236,9 +255,15 @@ async def validate_dashboard_session(request: Request) -> DashboardPrincipal:
         raise DashboardAuthError("Authentication is required")
     if state.role != DashboardRole.ADMIN:
         raise DashboardAuthError("Authentication is required")
-    if password_required and not state.password_verified:
+    if password_required and (not state.password_verified or state.password_hash != settings.password_hash):
         raise DashboardAuthError("Authentication is required")
-    if settings.totp_required_on_login and not state.totp_verified:
+    if (
+        settings.totp_required_on_login
+        and (
+            not state.totp_verified
+            or state.totp_secret_hash != _hash_totp_secret(settings.totp_secret_encrypted)
+        )
+    ):
         raise DashboardAuthError("TOTP verification is required for dashboard access", code="totp_required")
     return _set_dashboard_principal(
         request,

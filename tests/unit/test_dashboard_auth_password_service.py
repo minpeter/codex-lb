@@ -210,6 +210,7 @@ async def test_verify_totp_inherits_existing_password_session_expiry(monkeypatch
     password_session_id = store.create(
         password_verified=True,
         totp_verified=False,
+        password_hash=repository.settings.password_hash,
         ttl_seconds=original_ttl,
     )
     expected_remaining = original_ttl  # nothing has elapsed yet
@@ -257,6 +258,7 @@ async def test_verify_totp_caps_inherited_password_session_to_requested_ttl(
     password_session_id = store.create(
         password_verified=True,
         totp_verified=False,
+        password_hash=repository.settings.password_hash,
         ttl_seconds=long_password_ttl,
     )
 
@@ -310,6 +312,7 @@ async def test_verify_totp_does_not_call_session_store_get_twice(
     password_session_id = store.create(
         password_verified=True,
         totp_verified=False,
+        password_hash=repository.settings.password_hash,
         ttl_seconds=original_ttl,
     )
 
