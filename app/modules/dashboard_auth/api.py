@@ -85,8 +85,11 @@ async def _create_dashboard_session(
     totp_verified: bool,
     role: DashboardRole = DashboardRole.ADMIN,
     guest_verified: bool = False,
+    password_hash: str | None = None,
 ) -> tuple[str, int]:
     settings = await get_settings_cache().get()
+    if password_verified and password_hash != settings.password_hash:
+        raise DashboardAuthError("Authentication is required")
     ttl_seconds = resolve_dashboard_session_ttl_seconds(request, settings.dashboard_session_ttl_seconds)
     session_id = get_dashboard_session_store().create(
         password_verified=password_verified,
@@ -94,7 +97,7 @@ async def _create_dashboard_session(
         ttl_seconds=ttl_seconds,
         role=role,
         guest_verified=guest_verified,
-        password_hash=settings.password_hash if password_verified else None,
+        password_hash=password_hash if password_verified else None,
         guest_password_hash=settings.guest_password_hash if guest_verified else None,
     )
     return session_id, ttl_seconds
@@ -201,7 +204,6 @@ async def _validate_password_management_session(request: Request) -> None:
         )
     ):
         raise DashboardAuthError("Authentication is required")
-
 
     if settings.totp_required_on_login and not session_state.totp_verified:
         raise DashboardAuthError(
@@ -312,7 +314,10 @@ async def setup_password(
 
     await get_settings_cache().invalidate()
     session_id, session_ttl_seconds = await _create_dashboard_session(
-        request, password_verified=True, totp_verified=False
+        request,
+        password_verified=True,
+        totp_verified=False,
+        password_hash=(await get_settings_cache().get()).password_hash,
     )
     response = _decorate_session_response(
         await context.service.get_session_state(session_id),
@@ -408,7 +413,7 @@ async def login_password(
         ) from exc
 
     try:
-        await context.service.verify_password(
+        verified_password_hash = await context.service.verify_password(
             payload.password, actor_ip=request.client.host if request.client else None
         )
     except InvalidCredentialsError as exc:
@@ -420,7 +425,10 @@ async def login_password(
     await limiter.clear_for_key(rate_key, context.session)
 
     session_id, session_ttl_seconds = await _create_dashboard_session(
-        request, password_verified=True, totp_verified=False
+        request,
+        password_verified=True,
+        totp_verified=False,
+        password_hash=verified_password_hash,
     )
     response = _decorate_session_response(
         await context.service.get_session_state(session_id),

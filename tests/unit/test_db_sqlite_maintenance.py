@@ -97,22 +97,26 @@ def _close_connections(connections: list[_TrackedConnection]) -> None:
         connection.close()
 
 
-def test_same_second_backup_rotation_keeps_newest_backup(tmp_path: Path) -> None:
+@pytest.mark.parametrize("max_files", [1, 2, 3, 12])
+def test_same_second_backup_rotation_keeps_newest_backup(tmp_path: Path, max_files: int) -> None:
     db_path = tmp_path / "store.db"
     with closing(sqlite3.connect(db_path)) as connection, connection:
         connection.execute("CREATE TABLE items (value INTEGER NOT NULL)")
         connection.execute("INSERT INTO items VALUES (1)")
 
     now = datetime(2026, 7, 29, tzinfo=timezone.utc)
-    first = create_sqlite_pre_migration_backup(db_path, max_files=1, now=now)
-    with closing(sqlite3.connect(db_path)) as connection, connection:
-        connection.execute("INSERT INTO items VALUES (2)")
-    second = create_sqlite_pre_migration_backup(db_path, max_files=1, now=now)
-
-    assert not first.exists()
-    assert second.exists()
-    with closing(sqlite3.connect(second)) as connection:
-        assert connection.execute("SELECT value FROM items ORDER BY value").fetchall() == [(1,), (2,)]
+    for version in range(1, 16):
+        with closing(sqlite3.connect(db_path)) as connection, connection:
+            connection.execute("UPDATE items SET value = ?", (version,))
+        newest = create_sqlite_pre_migration_backup(db_path, max_files=max_files, now=now)
+        assert newest.exists()
+        backups = list(db_path.parent.glob("store.pre-migrate-*.db"))
+        assert len(backups) == min(version, max_files)
+        retained = []
+        for backup in backups:
+            with closing(sqlite3.connect(backup)) as connection:
+                retained.append(connection.execute("SELECT value FROM items").fetchone()[0])
+        assert sorted(retained) == list(range(max(1, version - max_files + 1), version + 1))
 
 
 def test_backup_closes_connections_before_rotating_old_snapshot(

@@ -300,7 +300,7 @@ class DashboardAuthService:
         if not setup_ok:
             raise PasswordAlreadyConfiguredError("Password is already configured")
 
-    async def verify_password(self, password: str, *, actor_ip: str | None = None) -> None:
+    async def verify_password(self, password: str, *, actor_ip: str | None = None) -> str:
         current = await self._repository.get_password_hash()
         if current is None:
             raise PasswordNotConfiguredError("Password is not configured")
@@ -310,6 +310,7 @@ class DashboardAuthService:
         settings = await self._repository.get_settings()
         if not settings.totp_required_on_login or settings.totp_secret_encrypted is None:
             AuditService.log_async("login_success", actor_ip=actor_ip, details={"method": "password"})
+        return current
 
     async def verify_guest_password(self, password: str | None, *, actor_ip: str | None = None) -> bool:
         settings = await self._repository.get_settings()

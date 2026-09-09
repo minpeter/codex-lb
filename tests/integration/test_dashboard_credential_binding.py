@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pyotp
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -69,6 +71,48 @@ async def test_password_rotation_invalidates_old_cookie_for_access_management_an
     fresh_login = await async_client.post("/api/dashboard-auth/password/login", json={"password": "new-password-456"})
     assert fresh_login.status_code == 200
     assert (await async_client.get("/api/settings")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_password_login_cannot_issue_session_after_interleaved_rotation(async_client, monkeypatch) -> None:
+    setup = await async_client.post("/api/dashboard-auth/password/setup", json={"password": "old-password-123"})
+    assert setup.status_code == 200
+    import app.modules.dashboard_auth.api as dashboard_auth_api
+
+    limiter = dashboard_auth_api.get_password_rate_limiter()
+    cleared, release = asyncio.Event(), asyncio.Event()
+    original_clear = limiter.clear_for_key
+
+    async def gated_clear(*args, **kwargs):
+        await original_clear(*args, **kwargs)
+        cleared.set()
+        await release.wait()
+
+    monkeypatch.setattr(limiter, "clear_for_key", gated_clear)
+    rotation_client = AsyncClient(transport=async_client._transport, base_url=str(async_client.base_url))
+    rotation_client.cookies.set(DASHBOARD_SESSION_COOKIE, async_client.cookies.get(DASHBOARD_SESSION_COOKIE))
+    login_client = AsyncClient(transport=async_client._transport, base_url=str(async_client.base_url))
+    login_task = asyncio.create_task(
+        login_client.post("/api/dashboard-auth/password/login", json={"password": "old-password-123"})
+    )
+    await asyncio.wait_for(cleared.wait(), timeout=5)
+    changed = await rotation_client.post(
+        "/api/dashboard-auth/password/change",
+        json={"currentPassword": "old-password-123", "newPassword": "new-password-456"},
+    )
+    assert changed.status_code == 200
+    release.set()
+    login = await login_task
+    protected = await async_client.get("/api/settings")
+    print(
+        f"change={changed.status_code} stale_credential_login={login.status_code} "
+        f"login_authenticated={login.json().get('authenticated')} "
+        f"protected_after_rotation={protected.status_code}"
+    )
+    assert login.status_code == 401
+    assert protected.status_code == 401
+    await login_client.aclose()
+    await rotation_client.aclose()
 
 
 @pytest.mark.asyncio

@@ -14,16 +14,17 @@ def _backup_name(source: Path, timestamp: datetime) -> str:
 def _next_backup_path(source: Path, timestamp: datetime) -> Path:
     base_name = _backup_name(source, timestamp)
     candidate = source.parent / base_name
-    if not candidate.exists():
+    prefix = f"{source.stem}.pre-migrate-{timestamp.strftime('%Y%m%dT%H%M%SZ')}-"
+    numbered = [
+        int(path.name.removeprefix(prefix).removesuffix(source.suffix))
+        for path in source.parent.glob(f"{prefix}*{source.suffix}")
+        if path.name.removeprefix(prefix).removesuffix(source.suffix).isdigit()
+    ]
+    if not candidate.exists() and not numbered:
         return candidate
 
-    sequence = 1
-    while True:
-        name = f"{source.stem}.pre-migrate-{timestamp.strftime('%Y%m%dT%H%M%SZ')}-{sequence}{source.suffix}"
-        candidate = source.parent / name
-        if not candidate.exists():
-            return candidate
-        sequence += 1
+    sequence = max(numbered, default=0) + 1
+    return source.parent / f"{prefix}{sequence}{source.suffix}"
 
 
 def list_sqlite_pre_migration_backups(source: Path) -> list[Path]:
@@ -66,10 +67,9 @@ def create_sqlite_pre_migration_backup(
         return (base, int(match.group(1)) if match else 0)
 
     backups.sort(key=backup_order)
+    old_backups = [backup for backup in backups if backup != backup_path]
     excess = len(backups) - max_files
-    if excess > 0:
-        for old_backup in backups[:excess]:
-            if old_backup != backup_path:
-                old_backup.unlink()
+    for old_backup in old_backups[:max(0, excess)]:
+        old_backup.unlink()
 
     return backup_path
