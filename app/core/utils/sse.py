@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 
 from app.core.errors import ResponseFailedEvent
 from app.core.types import JsonValue
@@ -51,7 +51,7 @@ async def inject_sse_keepalives(
     *,
     keepalive_frame: str = SSE_KEEPALIVE_FRAME,
     on_keepalive: Callable[[], None] | None = None,
-) -> AsyncIterator[str]:
+) -> AsyncGenerator[str, None]:
     """Wrap an SSE event iterator and emit comment heartbeats on idle gaps.
 
     Comment frames (lines starting with ``:``) are mandated by the SSE spec to
@@ -96,9 +96,12 @@ async def inject_sse_keepalives(
                 pending = None
                 yield chunk
         finally:
-            if pending is not None and not pending.done():
-                pending.cancel()
+            if pending is not None:
+                if not pending.done():
+                    pending.cancel()
                 try:
+                    # A read completed during the heartbeat yield still owns
+                    # an outcome that must be retrieved before source closure.
                     # Not ``await pending``: a level-cancelled consumer scope
                     # re-cancels this task on every loop iteration, and a
                     # direct task await cascades each cancel into ``pending``

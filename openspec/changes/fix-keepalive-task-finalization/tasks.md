@@ -1,0 +1,4 @@
+- [x] Reproduce completed-read EOF and error cleanup races deterministically.
+- [x] Retrieve owned read-task outcomes and preserve cancellation semantics.
+- [x] Verify HTTP streaming, related regressions, types and specifications.
+- [ ] Commit and deploy B; verify readiness and settings preservation.
