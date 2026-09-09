@@ -270,3 +270,73 @@ async def test_owned_task_observation_reports_completion_within_the_virtual_dead
     # failure is observed and logged instead of being reported as a timeout.
     assert "owned child failed after reader cancellation" in caplog.text
     assert scheduler.pending_timers == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_id", [None, "resp_A"])
+async def test_expired_sent_request_retires_only_uncorrelated_socket(
+    monkeypatch: pytest.MonkeyPatch,
+    response_id: str | None,
+) -> None:
+    service, clock, scheduler = _virtual_service()
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: SimpleNamespace(sse_keepalive_interval_seconds=0.0))
+    request = proxy_service._WebSocketRequestState(
+        request_id="A",
+        model="gpt-5.5",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=clock.monotonic(),
+        response_id=response_id,
+        response_create_sent_at=clock.monotonic(),
+        response_create_gate_acquired=True,
+        skip_request_log=True,
+    )
+    pending = deque([request])
+    gate = asyncio.Semaphore(0)
+    control = proxy_service._WebSocketUpstreamControl()
+    downstream = _DownstreamWebSocket()
+    closed = asyncio.Event()
+    upstream = _BlockingUpstream()
+
+    async def close() -> None:
+        closed.set()
+
+    monkeypatch.setattr(upstream, "close", close)
+    retirement_at_admission: list[bool] = []
+
+    async def admit_next_request() -> None:
+        await gate.acquire()
+        retirement_at_admission.append(control.reconnect_requested)
+
+    admission = scheduler.create_task(admit_next_request())
+    relay = scheduler.create_task(
+        service._relay_upstream_websocket_messages(
+            cast(WebSocket, downstream),
+            cast(UpstreamWebSocket, upstream),
+            account=cast(Account, SimpleNamespace(id="account-expiry")),
+            account_id_value="account-expiry",
+            pending_requests=pending,
+            pending_lock=anyio.Lock(),
+            client_send_lock=anyio.Lock(),
+            api_key=None,
+            upstream_control=control,
+            response_create_gate=gate,
+            proxy_request_budget_seconds=5.0,
+            stream_idle_timeout_seconds=30.0,
+            downstream_activity=proxy_service._DownstreamWebSocketActivity(),
+        )
+    )
+    try:
+        await scheduler.drain()
+        await scheduler.advance(5.0)
+        await scheduler.drain()
+        assert admission.done()
+        assert retirement_at_admission == [response_id is None]
+        assert closed.is_set() is (response_id is None)
+        assert relay.done() is (response_id is None)
+        assert [json.loads(text)["type"] for text in downstream.sent_text] == ["response.failed"]
+    finally:
+        relay.cancel()
+        await asyncio.gather(relay, admission, return_exceptions=True)
+        await scheduler.cancel_owned_tasks()

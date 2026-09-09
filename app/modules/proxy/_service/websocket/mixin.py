@@ -5156,7 +5156,23 @@ class _WebSocketMixin:
                         websocket=websocket,
                         client_send_lock=client_send_lock,
                         response_create_gate=response_create_gate,
+                        upstream_control=upstream_control,
                     )
+                    if upstream_control.reconnect_requested:
+                        await proxy._fail_pending_websocket_requests(
+                            account_id_value=account_id_value,
+                            pending_requests=pending_requests,
+                            pending_lock=pending_lock,
+                            error_code="stream_incomplete",
+                            error_message="Upstream websocket retired after uncorrelated request timeout",
+                            api_key=api_key,
+                            websocket=websocket,
+                            client_send_lock=client_send_lock,
+                            response_create_gate=response_create_gate,
+                            penalize_account=False,
+                        )
+                        await upstream.close()
+                        break
                     continue
                 if message.kind == "text" and message.text is not None:
                     downstream_activity.mark()
@@ -6296,6 +6312,7 @@ class _WebSocketMixin:
         websocket: WebSocket | None = None,
         client_send_lock: anyio.Lock | None = None,
         response_create_gate: asyncio.Semaphore | None = None,
+        upstream_control: _WebSocketUpstreamControl | None = None,
     ) -> None:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
@@ -6306,6 +6323,13 @@ class _WebSocketMixin:
                 for request_state in list(pending_requests)
                 if now >= request_state.started_at + request_budget_seconds
             ]
+            # Fence socket reuse before terminal cleanup releases the create gate.
+            # Without a response id, late created events cannot be safely correlated.
+            if upstream_control is not None and any(
+                request_state.response_id is None and request_state.response_create_sent_at is not None
+                for request_state in expired_requests
+            ):
+                upstream_control.reconnect_requested = True
             for request_state in expired_requests:
                 pending_requests.remove(request_state)
         if not expired_requests:
