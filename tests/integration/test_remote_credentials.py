@@ -200,6 +200,22 @@ async def test_source_reactivation_propagates(replica, source):
     assert not is_account_routing_unavailable("source-id")
 
 
+async def test_pending_delete_snapshot_does_not_recreate_account(replica, source):
+    await replica.sync()
+    async with get_background_session() as session:
+        row = await AccountsRepository(session).get_by_id("source-id")
+        assert row is not None
+        row.delete_requested_at = datetime(2026, 1, 2)
+        await session.commit()
+
+    await replica.sync()
+
+    async with get_background_session() as session:
+        row = await AccountsRepository(session).get_by_id("source-id")
+        assert row is not None
+        assert row.delete_requested_at == datetime(2026, 1, 2)
+
+
 async def test_valid_empty_snapshot_disables_without_deleting(replica, source):
     await replica.sync()
     source.accounts.clear()

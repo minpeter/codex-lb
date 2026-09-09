@@ -41,7 +41,14 @@ class RemoteCredentialsRepository:
             updated = 0
             disabled = 0
             source_ids = {item.account_id for item in snapshot.accounts}
+            pending_delete_ids = set(
+                await self._session.scalars(
+                    select(Account.id).where(Account.delete_requested_at.is_not(None))
+                )
+            )
             for item in snapshot.accounts:
+                if item.account_id in pending_delete_ids:
+                    continue
                 row = rows.get(item.account_id)
                 exported = exports.get(item.account_id)
                 credentials_replaced = False
