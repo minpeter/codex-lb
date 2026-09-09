@@ -5027,6 +5027,25 @@ def test_all_primary_pressured_fallback_honors_primary_reset_preference():
     assert result.account.account_id == "early"
 
 
+@pytest.mark.parametrize("routing_strategy", ["sequential_drain", "reset_drain", "single_account"])
+@pytest.mark.parametrize("blocked_status", [AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED])
+def test_budget_safe_selection_falls_back_to_usable_pressured_sibling(routing_strategy, blocked_status):
+    states = [
+        AccountState("preferred", blocked_status, used_percent=10.0, secondary_used_percent=10.0),
+        AccountState("sibling", AccountStatus.ACTIVE, used_percent=99.0, secondary_used_percent=99.0),
+    ]
+
+    result = _select_account_preferring_budget_safe(
+        states,
+        prefer_earlier_reset=False,
+        routing_strategy=routing_strategy,
+        budget_threshold_pct=95.0,
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "sibling"
+
+
 def test_drain_budget_safe_selection_filters_over_threshold_accounts():
     states = [
         AccountState(

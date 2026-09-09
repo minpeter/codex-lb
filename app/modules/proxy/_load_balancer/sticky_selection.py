@@ -1879,8 +1879,25 @@ def _select_account_preferring_budget_safe(
             for state in state_list
             if state.routing_policy != ROUTING_POLICY_PRESERVE and not state_budget_threshold(state)
         ]
-        return select_account(
+        budget_safe_result = select_account(
             budget_safe_states or state_list,
+            prefer_earlier_reset=prefer_earlier_reset,
+            prefer_earlier_reset_window=prefer_earlier_reset_window,
+            routing_strategy=routing_strategy,
+            allow_backoff_fallback=allow_backoff_fallback,
+            deterministic_probe=deterministic_probe,
+            relative_availability_power=relative_availability_power,
+            relative_availability_top_k=relative_availability_top_k,
+            traffic_class=traffic_class,
+            ignore_standard_quota=ignore_standard_quota,
+            routing_costs=routing_costs_by_account_id,
+            allow_usage_exhaustion_error=allow_usage_exhaustion_error,
+            usage_exhaustion_states=usage_exhaustion_states,
+        )
+        if budget_safe_result.account is not None or not budget_safe_states:
+            return budget_safe_result
+        return select_account(
+            state_list,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
             routing_strategy=routing_strategy,
