@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import errno
 import logging
@@ -17,6 +18,7 @@ from aiohttp.client_reqrep import ConnectionKey
 import app.core.auth.refresh as refresh_module
 import app.core.clients.model_fetcher as model_fetcher_module
 import app.core.openai.model_refresh_scheduler as scheduler_module
+from app.core.clients.codex_version import CodexVersionCache, get_codex_version_cache
 from app.core.config.settings import Settings
 from app.core.openai.model_registry import ReasoningLevel, UpstreamModel
 from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute
@@ -566,3 +568,111 @@ async def test_refresh_once_clears_registry_when_no_active_accounts(
 
     clear.assert_awaited_once_with()
     invalidate.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leader", [False, True])
+@pytest.mark.parametrize("fetch_fails", [False, True])
+async def test_start_warms_version_before_leader_gate_without_extra_model_jobs(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, leader: bool, fetch_fails: bool
+) -> None:
+    cache = get_codex_version_cache()
+    await cache.invalidate()
+    tick_done = asyncio.Event()
+    order: list[str] = []
+
+    async def fetch(_cache: CodexVersionCache) -> str:
+        order.append("version")
+        if fetch_fails:
+            raise RuntimeError("release source unavailable")
+        return "9.9.9"
+
+    class Election:
+        async def run_if_leader(self, fn: Callable[[], Awaitable[object]]) -> object | None:
+            order.append("election")
+            return await fn() if leader else None
+
+    async def finish_tick(*_args: object) -> bool:
+        tick_done.set()
+        return True
+
+    refresh = AsyncMock(side_effect=finish_tick)
+    reconcile = AsyncMock(side_effect=finish_tick)
+    monkeypatch.setattr(CodexVersionCache, "_fetch_latest_version", fetch)
+    monkeypatch.setattr(scheduler_module, "_get_leader_election", lambda: Election())
+    monkeypatch.setattr(scheduler_module.ModelRefreshScheduler, "_refresh_as_leader", refresh)
+    monkeypatch.setattr(scheduler_module, "reconcile_model_registry_from_store", reconcile)
+    scheduler = scheduler_module.ModelRefreshScheduler(interval_seconds=3600, enabled=True)
+    try:
+        await scheduler.start()
+        task = scheduler._task
+        await scheduler.start()
+        assert scheduler._task is task
+        async with asyncio.timeout(2):
+            await tick_done.wait()
+        assert order == ["version", "election"]
+        assert refresh.await_count == int(leader)
+        assert reconcile.await_count == int(not leader)
+        assert cache.cached_version_or_default() == ("0.153.4" if fetch_fails else "9.9.9")
+        if fetch_fails:
+            assert any(
+                record.levelno == logging.WARNING
+                and record.exc_info is not None
+                and isinstance(record.exc_info[1], RuntimeError)
+                for record in caplog.records
+            )
+    finally:
+        await scheduler.stop()
+        await cache.invalidate()
+    assert scheduler._task is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_model_scheduler_never_starts_version_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    fetch = AsyncMock(return_value="9.9.9")
+    refresh = AsyncMock()
+    monkeypatch.setattr(CodexVersionCache, "_fetch_latest_version", fetch)
+    monkeypatch.setattr(scheduler_module.ModelRefreshScheduler, "_refresh_once", refresh)
+    monkeypatch.setattr(scheduler_module, "get_settings", lambda: Settings(model_registry_enabled=False))
+    scheduler = scheduler_module.build_model_refresh_scheduler()
+    await scheduler.start()
+    await scheduler.stop()
+    assert scheduler._task is None
+    fetch.assert_not_awaited()
+    refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_inflight_version_fetch_without_starting_model_refresh(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    cache = get_codex_version_cache()
+    await cache.invalidate()
+    fetching = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fetch(_cache: CodexVersionCache) -> str:
+        fetching.set()
+        try:
+            await asyncio.Future[None]()
+        finally:
+            cancelled.set()
+        raise AssertionError("fetch must be cancelled")
+
+    refresh = AsyncMock()
+    monkeypatch.setattr(CodexVersionCache, "_fetch_latest_version", fetch)
+    monkeypatch.setattr(scheduler_module.ModelRefreshScheduler, "_refresh_once", refresh)
+    scheduler = scheduler_module.ModelRefreshScheduler(interval_seconds=3600, enabled=True)
+    try:
+        await scheduler.start()
+        task = scheduler._task
+        async with asyncio.timeout(2):
+            await fetching.wait()
+            await scheduler.stop()
+        assert task is not None and task.cancelled()
+        assert cancelled.is_set()
+        refresh.assert_not_awaited()
+        assert not [record for record in caplog.records if record.name == scheduler_module.logger.name]
+    finally:
+        await scheduler.stop()
+        await cache.invalidate()

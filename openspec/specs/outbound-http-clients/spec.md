@@ -296,7 +296,17 @@ For a non-native request, the service MUST:
 
 Resolving the fingerprint version for an outbound request MUST NOT perform a
 blocking network call on the request path; the version is read from an
-in-process cache that is refreshed by existing background refresh paths.
+in-process cache. Every replica with an enabled model refresh scheduler MUST
+attempt to warm that cache on every loop tick, before the model refresh,
+regardless of scheduler
+leadership (the lookup is a public release lookup that carries no account
+credential). A successful lookup MUST populate the cache on a follower as well
+as a leader. A cold request MAY use the configured fallback before warming
+completes. A disabled scheduler MUST NOT start a version lookup.
+A warm-up failure MUST NOT stop
+the model refresh tick. The configured fallback (`model_registry_client_version`)
+SHALL default to `0.153.4`; explicit operator overrides MUST be preserved.
+Cancellation MUST propagate rather than be logged as an ordinary lookup failure.
 
 #### Scenario: non-native SDK http request is rewritten to the Codex CLI fingerprint
 
@@ -386,6 +396,19 @@ in-process cache that is refreshed by existing background refresh paths.
   for `<version>`
 - **AND** the outbound `version` header uses that same configured default
 - **AND** resolving the version does not perform a network call on the request path
+
+#### Scenario: Non-leader replica warms the client version itself
+
+- **GIVEN** a replica that does not hold the scheduler leader lease (for example the live color of a blue/green pair whose standby still holds the lease)
+- **WHEN** its model refresh loop ticks
+- **THEN** it fetches and caches the current Codex client version before the leader-gated model refresh
+- **AND** non-native requests it forwards carry that version in `User-Agent` and `version` instead of the configured fallback
+
+#### Scenario: Version warm-up failure does not stop the refresh tick
+
+- **GIVEN** the public release lookup fails on a replica
+- **WHEN** its model refresh loop ticks
+- **THEN** the failure is logged, the cached or fallback version is kept, and the leader-gated refresh (or non-leader reconcile) still runs
 
 ### Requirement: OAuth token exchange must use a proxy pool when active proxy bindings exist
 
