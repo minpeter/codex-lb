@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
 
+import app.core.clients.native_egress as native_egress_module
 from app.core.clients.native_egress import (
     NativeEgressError,
     NativeEgressProtocolError,
@@ -48,7 +51,7 @@ def _write_helper(path: Path, source: str) -> None:
     if source.startswith("#!/usr/bin/env python3\n"):
         source = source.replace(
             "#!/usr/bin/env python3\n",
-            f"#!/usr/bin/env python3\n{_HELPER_PROTOCOL_PREAMBLE}\n",
+            f"#!{sys.executable}\n{_HELPER_PROTOCOL_PREAMBLE}\n",
             1,
         )
     path.write_text(source, encoding="utf-8")
@@ -141,6 +144,7 @@ sys.stdin.read()
 """,
         encoding="utf-8",
     )
+    helper.write_text(helper.read_text().replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1))
     helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
     client = SubprocessNativeEgressClient(helper)
 
@@ -417,7 +421,11 @@ async def test_client_close_is_idempotent_and_prevents_restart(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_client_close_does_not_hang_when_stream_queue_is_full(tmp_path: Path) -> None:
+@pytest.mark.parametrize("overflow", ["bytes", "events"])
+async def test_client_close_does_not_hang_when_stream_queue_is_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overflow: str
+) -> None:
+    observed = _observe_helper_events(monkeypatch)
     helper = tmp_path / "native-helper"
     _write_helper(
         helper,
@@ -436,10 +444,12 @@ for line in sys.stdin:
         "http_version": "HTTP/2.0", "headers": [],
     }), flush=True)
     if command["url"].endswith("/slow-consumer"):
-        for _ in range(256):
+        mode = dict(command["headers"])["overflow"]
+        # 48 large chunks hit bytes; 4097 empty chunks hit only event capacity.
+        data = base64.b64encode(b"x" * (1024 * 1024)).decode() if mode == "bytes" else ""
+        for _ in range(48 if mode == "bytes" else 4097):
             print(json.dumps({
-                "type": "chunk", "request_id": request_id,
-                "data": base64.b64encode(b"x").decode(),
+                "type": "chunk", "request_id": request_id, "data": data,
             }), flush=True)
     else:
         print(json.dumps({
@@ -450,18 +460,29 @@ for line in sys.stdin:
 """,
     )
     client = SubprocessNativeEgressClient(helper)
-    stalled = await client.request(
-        NativeEgressRequest(method="GET", url="https://example.test/slow-consumer", headers={})
-    )
-    await asyncio.sleep(0.05)
+    try:
+        stalled = await client.request(
+            NativeEgressRequest(method="GET", url="https://example.test/slow-consumer", headers={"overflow": overflow})
+        )
+        process = client._process
+        cancelled = await _wait_for_helper_event(observed, "cancelled")
+        assert cancelled["request_id"] == stalled._request_id
+        assert stalled._request_id not in client._streams
+        assert isinstance(stalled._events, native_egress_module._BoundedEventQueue)
+        assert stalled._events.queued_bytes == 0
+        assert stalled._events.qsize() == 1
 
-    healthy = await client.request(NativeEgressRequest(method="GET", url="https://example.test/healthy", headers={}))
-
-    assert await asyncio.wait_for(healthy.read(), timeout=2.0) == b"ok"
-    with pytest.raises(NativeEgressTransportError, match="bounded event queue"):
-        await stalled.read()
-
-    await asyncio.wait_for(client.aclose(), timeout=2.0)
+        healthy = await client.request(
+            NativeEgressRequest(method="GET", url="https://example.test/healthy", headers={})
+        )
+        assert await asyncio.wait_for(healthy.read(), timeout=2.0) == b"ok"
+        with pytest.raises(NativeEgressTransportError) as exc_info:
+            await stalled.read()
+        assert exc_info.value.failure_phase == "consumer_backpressure"
+        assert client._process is process
+        assert process is not None and process.returncode is None
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=2.0)
 
 
 def test_native_helper_is_discovered_only_by_fixed_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -786,3 +807,220 @@ os._exit(9)
 
     assert client._generation == 1
     await client.aclose()
+
+
+def _observe_helper_events(monkeypatch: pytest.MonkeyPatch) -> asyncio.Queue[dict[str, object]]:
+    observed: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    read_event = native_egress_module._read_event
+
+    async def observe(stdout: asyncio.StreamReader) -> dict[str, object]:
+        event = await read_event(stdout)
+        observed.put_nowait({"type": event.get("type"), "request_id": event.get("request_id")})
+        return event
+
+    monkeypatch.setattr(native_egress_module, "_read_event", observe)
+    return observed
+
+
+async def _wait_for_helper_event(observed: asyncio.Queue[dict[str, object]], kind: str) -> dict[str, object]:
+    async with asyncio.timeout(10):
+        while True:
+            event = await observed.get()
+            if event.get("type") == kind:
+                return event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count,decoded_size", [(2000, 5), (16, 3 * 512 * 1024)])
+async def test_buffered_chunk_burst_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int, decoded_size: int
+) -> None:
+    observed = _observe_helper_events(monkeypatch)
+    helper = tmp_path / "native-helper"
+    _write_helper(
+        helper,
+        f"""#!/usr/bin/env python3
+import base64
+for line in sys.stdin:
+    command = json.loads(line)
+    request_id = command["request_id"]
+    if command["type"] == "cancel":
+        print(json.dumps({{"type": "cancelled", "request_id": request_id}}), flush=True)
+        continue
+    print(json.dumps({{
+        "type": "head", "request_id": request_id, "status": 200,
+        "http_version": "HTTP/2.0", "headers": [],
+    }}), flush=True)
+    data = base64.b64encode(b"z" * {decoded_size}).decode()
+    for _ in range({count}):
+        print(json.dumps({{"type": "chunk", "request_id": request_id, "data": data}}), flush=True)
+    print(json.dumps({{"type": "end", "request_id": request_id}}), flush=True)
+""",
+    )
+    client = SubprocessNativeEgressClient(helper)
+    try:
+        response = await client.request(NativeEgressRequest(method="GET", url="https://example.test/burst", headers={}))
+        terminal = await _wait_for_helper_event(observed, "end")
+        assert terminal["request_id"] == response._request_id
+        # No consumer runs until the complete burst has passed the real pipe reader.
+        assert isinstance(response._events, native_egress_module._BoundedEventQueue)
+        assert response._events.maxsize == 4096
+        assert response._events._max_bytes == 32 * 1024 * 1024
+        assert response._events.queued_bytes == count * len(base64.b64encode(b"z" * decoded_size))
+        assert await asyncio.wait_for(response.read(), timeout=10) == b"z" * (count * decoded_size)
+        assert response._events.queued_bytes == 0
+        assert response._request_id not in client._streams
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_bounded_event_queue_charges_projected_bytes_and_releases_on_get() -> None:
+    queue = native_egress_module._BoundedEventQueue(max_events=4, max_bytes=10)
+    queue.put_nowait({"type": "chunk", "data": "abcd"})
+    queue.put_nowait({"type": "websocket_text", "text": "efgh"})
+    assert queue.queued_bytes == 8 and not queue.full()
+    with pytest.raises(asyncio.QueueFull):
+        queue.put_nowait({"type": "chunk", "data": "ijk"})
+    assert queue.queued_bytes == 8
+    queue.put_nowait({"type": "chunk", "data": "ij"})
+    queue.put_nowait({"type": "end"})
+    assert queue.queued_bytes == 10 and queue.full()
+    with pytest.raises(asyncio.QueueFull):
+        queue.put_nowait({"type": "cancelled"})
+    assert await queue.get() == {"type": "chunk", "data": "abcd"}
+    assert queue.queued_bytes == 6 and not queue.full()
+    with pytest.raises(asyncio.QueueFull):
+        queue.put_nowait({"type": "chunk", "data": "12345"})
+    queue.put_nowait({"type": "chunk", "data": "1234"})
+    while not queue.empty():
+        queue.get_nowait()
+    assert queue.queued_bytes == 0
+    queue.put_nowait(RuntimeError("failure"))
+    assert queue.queued_bytes == 0
+    queue.get_nowait()
+    queue.put_nowait({"type": "websocket_text", "text": "\u00e9\u00e9"})
+    assert queue.queued_bytes == 4
+    await queue.get()
+    queue.put_nowait({"type": "chunk", "data": "x" * 64})
+    assert queue.queued_bytes == 64
+    with pytest.raises(asyncio.QueueFull):
+        queue.put_nowait({"type": "chunk", "data": "y"})
+    queue.put_nowait({"type": "end"})
+    queue.put_nowait({"type": "error"})
+    queue.put_nowait({"type": "cancelled"})
+    with pytest.raises(asyncio.QueueFull):
+        queue.put_nowait(RuntimeError("failure"))
+    while not queue.empty():
+        await queue.get()
+    assert queue.queued_bytes == 0
+
+
+def test_generation_failure_drains_bytes_only_for_owned_generation(tmp_path: Path) -> None:
+    client = SubprocessNativeEgressClient(tmp_path / "unused")
+    old = native_egress_module._new_stream_queue()
+    current = native_egress_module._new_stream_queue()
+    for queue in (old, current):
+        queue.put_nowait({"type": "chunk", "data": "eA=="})
+    client._generation = 2
+    client._streams = {"1:1": (1, old), "2:1": (2, current)}
+    failure = NativeEgressTransportError("helper failed", failure_phase="helper_exit")
+    client._fail_generation(1, failure)
+    assert old.queued_bytes == 0
+    assert old.get_nowait() is failure
+    assert current.queued_bytes == 4
+    assert client._streams == {"2:1": (2, current)}
+    client._finish_request("2:1", 1, current)
+    client._finish_request("2:1", 2, old)
+    assert client._streams == {"2:1": (2, current)}
+    client._fail_generation(2, failure)
+    assert current.queued_bytes == 0
+    assert current.get_nowait() is failure
+    assert not client._streams
+
+
+@pytest.mark.asyncio
+async def test_websocket_helper_budget_retains_separate_message_cap(tmp_path: Path) -> None:
+    helper = tmp_path / "native-helper"
+    _write_helper(helper, _websocket_helper_source())
+    client = SubprocessNativeEgressClient(helper)
+    try:
+        websocket = await client.websocket(
+            NativeWebSocketRequest(
+                url="wss://example.test/responses",
+                headers={"user-agent": "codex-cli", "sec-websocket-protocol": "openai"},
+                connect_timeout_seconds=2,
+                max_message_bytes=1024,
+            )
+        )
+        assert isinstance(websocket._events, native_egress_module._BoundedEventQueue)
+        assert websocket._events.maxsize == 4096
+        assert websocket._events._max_bytes == 32 * 1024 * 1024
+        assert websocket._messages.maxsize == 64
+        # Await each acknowledged frame, without consuming downstream messages.
+        for _ in range(64):
+            await websocket.send_text("x")
+        with pytest.raises(NativeEgressTransportError) as exc_info:
+            await asyncio.wait_for(websocket.send_text("overflow"), timeout=2)
+        assert exc_info.value.failure_phase == "consumer_backpressure"
+        await asyncio.wait_for(websocket._pump_task, timeout=2)
+        assert websocket._completed
+        assert websocket._request_id not in client._streams
+        assert websocket._events.queued_bytes == 0
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [None, "%%%"])
+async def test_malformed_chunk_releases_charge_and_cancels_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data: str | None
+) -> None:
+    observed = _observe_helper_events(monkeypatch)
+    helper = tmp_path / "native-helper"
+    _write_helper(
+        helper,
+        f"""#!/usr/bin/env python3
+for line in sys.stdin:
+    command = json.loads(line)
+    request_id = command["request_id"]
+    if command["type"] == "cancel":
+        print(json.dumps({{"type": "cancelled", "request_id": request_id}}), flush=True)
+        continue
+    print(json.dumps({{
+        "type": "head", "request_id": request_id, "status": 200,
+        "http_version": "HTTP/2.0", "headers": [],
+    }}), flush=True)
+    print(json.dumps({{"type": "chunk", "request_id": request_id, "data": {data!r}}}), flush=True)
+""",
+    )
+    client = SubprocessNativeEgressClient(helper)
+    try:
+        response = await client.request(NativeEgressRequest(method="GET", url="https://example.test/bad", headers={}))
+        with pytest.raises(NativeEgressProtocolError):
+            await asyncio.wait_for(response.read(), timeout=2)
+        cancelled = await _wait_for_helper_event(observed, "cancelled")
+        assert cancelled["request_id"] == response._request_id
+        assert response._request_id not in client._streams
+        assert isinstance(response._events, native_egress_module._BoundedEventQueue)
+        assert response._events.queued_bytes == 0
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frame", [b"not-json\n", b"[]\n", b"\xff\n"])
+async def test_helper_rejects_malformed_bounded_frames(frame: bytes) -> None:
+    reader = asyncio.StreamReader(limit=native_egress_module._NATIVE_EVENT_LINE_LIMIT)
+    reader.feed_data(frame)
+    with pytest.raises(NativeEgressProtocolError):
+        await native_egress_module._read_event(reader)
+
+
+@pytest.mark.asyncio
+async def test_helper_line_limit_is_unchanged_and_enforced() -> None:
+    assert native_egress_module._NATIVE_EVENT_LINE_LIMIT == 24 * 1024 * 1024
+    reader = asyncio.StreamReader(limit=native_egress_module._NATIVE_EVENT_LINE_LIMIT)
+    reader.feed_data(b"x" * (native_egress_module._NATIVE_EVENT_LINE_LIMIT + 1))
+    with pytest.raises(ValueError):
+        await native_egress_module._read_event(reader)
