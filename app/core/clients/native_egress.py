@@ -835,11 +835,10 @@ class SubprocessNativeEgressClient:
                 events = state[1]
                 try:
                     events.put_nowait(event)
-                    if event.get("type") in {"head", "websocket_open"}:
-                        # Hand the accepted response to its consumer before a
-                        # helper with already-buffered output can fill the body
-                        # queue in this reader task's scheduling turn.
-                        await asyncio.sleep(0)
+                    # readline() need not suspend for buffered helper output.
+                    # Let ready consumers drain before dispatching another event;
+                    # a stalled consumer still hits the bounded queue.
+                    await asyncio.sleep(0)
                 except asyncio.QueueFull:
                     overflow_failure = NativeEgressTransportError(
                         "native stream consumer exceeded the bounded event queue",

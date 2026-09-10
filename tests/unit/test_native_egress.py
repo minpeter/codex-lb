@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import json
 import os
 import stat
 import sys
@@ -872,6 +874,60 @@ for line in sys.stdin:
         assert response._request_id not in client._streams
     finally:
         await asyncio.wait_for(client.aclose(), timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["chunk", "websocket_text"])
+async def test_reader_schedules_subscribed_consumer_between_buffered_events(kind: str) -> None:
+    depths: list[int] = []
+
+    class ObservedQueue(native_egress_module._BoundedEventQueue):
+        def put_nowait(self, item: dict[str, object] | BaseException) -> None:
+            if isinstance(item, dict):
+                depths.append(self.qsize())
+            super().put_nowait(item)
+
+    events = ObservedQueue(max_events=4096, max_bytes=32 * 1024 * 1024)
+    stdout = asyncio.StreamReader()
+
+    class ExitedTransport(asyncio.SubprocessTransport):
+        def get_pid(self) -> int:
+            return 0
+
+        def get_returncode(self) -> int:
+            return 0
+
+    loop = asyncio.get_running_loop()
+    protocol = asyncio.subprocess.SubprocessStreamProtocol(limit=65536, loop=loop)
+    protocol.stdout = stdout
+    process = asyncio.subprocess.Process(ExitedTransport(), protocol, loop)
+    client = SubprocessNativeEgressClient("unused")
+    client._generation = 1
+    client._streams["active"] = (1, events)
+    subscribed = asyncio.Event()
+
+    async def consume() -> list[dict[str, object] | BaseException]:
+        subscribed.set()
+        return [await events.get(), await events.get()]
+
+    consumer = asyncio.create_task(consume())
+    reader = asyncio.create_task(client._read_process(process, 1))
+    burst = [{"type": kind, "request_id": "active", "data": "YQ==", "text": "a"}] * 2
+    try:
+        async with asyncio.timeout(2):
+            await subscribed.wait()
+            # Both readline calls now complete synchronously. Queue capacity
+            # cannot explain the ordering: only two of 4096 slots are needed.
+            stdout.feed_data(b"".join(json.dumps(event).encode() + b"\n" for event in burst))
+            assert await consumer == burst
+        assert depths == [0, 0]
+        assert events.queued_bytes == 0
+    finally:
+        reader.cancel()
+        consumer.cancel()
+        for task in (reader, consumer):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 @pytest.mark.asyncio
