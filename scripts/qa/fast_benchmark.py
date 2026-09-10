@@ -2,7 +2,8 @@
 """Sequential paired B HTTP benchmark; network access occurs only via the CLI.
 
 Config is a mode-0600 JSON file with base_url (API prefix, e.g. /v1), keys
-(model -> key), reasoning_effort (optional model -> low|minimal), and boolean
+(model -> key), models (optional list; defaults to Astra, Luna and Terra),
+reasoning_effort (optional model -> low|minimal), and boolean
 standard_tier_unenforced_verified and single_account_per_model_verified
 attestations supplied by the lead. No provider/key-management calls are made.
 
@@ -97,6 +98,7 @@ class Config:
     keys: dict[str, str] = field(repr=False)
     reasoning_effort: dict[str, Effort]
     headers: dict[str, str] = field(default_factory=dict, repr=False)
+    models: tuple[str, ...] = MODELS
 
 
 def load_config(path: Path) -> Config:
@@ -136,8 +138,16 @@ def load_config(path: Path) -> Config:
     efforts = value.get("reasoning_effort", {})
     if not isinstance(keys, dict) or not isinstance(efforts, dict):
         raise ValueError("keys and reasoning_effort must be model maps")
+    models = value.get("models", list(MODELS))
+    if (
+        not isinstance(models, list)
+        or not models
+        or any(not isinstance(model, str) or not model or any(c.isspace() for c in model) for model in models)
+        or len(set(models)) != len(models)
+    ):
+        raise ValueError("models must be a nonempty list of unique model names without whitespace")
     resolved: dict[str, Effort] = {}
-    for model in MODELS:
+    for model in models:
         key = keys.get(model)
         if not isinstance(key, str) or not key or any(char.isspace() for char in key):
             raise ValueError("each model requires a nonempty key without whitespace")
@@ -146,32 +156,36 @@ def load_config(path: Path) -> Config:
             raise ValueError("reasoning effort must be low or minimal")
         resolved[model] = effort
     headers = value.get("headers", {})
-    if not isinstance(headers, dict) or len({name.lower() for name in headers}) != len(headers) or any(
-        not isinstance(name, str)
-        or not re.fullmatch(r"[!#$%&\x27*+.^_`|~0-9A-Za-z-]+", name)
-        or name.lower()
-        in {
-            "authorization",
-            "accept",
-            "host",
-            "content-length",
-            "transfer-encoding",
-            "content-type",
-            "connection",
-            "keep-alive",
-            "te",
-            "trailer",
-            "upgrade",
-            "proxy-connection",
-            "proxy-authorization",
-            "proxy-authenticate",
-        }
-        or not isinstance(content, str)
-        or any(ord(char) < 32 or ord(char) > 126 for char in content)
-        for name, content in headers.items()
+    if (
+        not isinstance(headers, dict)
+        or len({name.lower() for name in headers}) != len(headers)
+        or any(
+            not isinstance(name, str)
+            or not re.fullmatch(r"[!#$%&\x27*+.^_`|~0-9A-Za-z-]+", name)
+            or name.lower()
+            in {
+                "authorization",
+                "accept",
+                "host",
+                "content-length",
+                "transfer-encoding",
+                "content-type",
+                "connection",
+                "keep-alive",
+                "te",
+                "trailer",
+                "upgrade",
+                "proxy-connection",
+                "proxy-authorization",
+                "proxy-authenticate",
+            }
+            or not isinstance(content, str)
+            or any(ord(char) < 32 or ord(char) > 126 for char in content)
+            for name, content in headers.items()
+        )
     ):
         raise ValueError("headers must be printable HTTP headers without auth or framing overrides")
-    return Config(url.rstrip("/"), {model: keys[model] for model in MODELS}, resolved, headers)
+    return Config(url.rstrip("/"), {model: keys[model] for model in models}, resolved, headers, tuple(models))
 
 
 @dataclass
@@ -489,14 +503,14 @@ class Trial:
     fast: bool
 
 
-def schedule(seed: int, rounds: int) -> list[Trial]:
+def schedule(seed: int, rounds: int, models: tuple[str, ...] = MODELS) -> list[Trial]:
     if rounds < 2 or rounds % 2:
         raise ValueError("rounds must be positive and even for exact AB/BA balance")
     rng = random.Random(seed)
-    starts = {model: bool(rng.getrandbits(1)) for model in MODELS}
+    starts = {model: bool(rng.getrandbits(1)) for model in models}
     result = []
     for round_id in range(rounds):
-        for model in rng.sample(list(MODELS), len(MODELS)):
+        for model in rng.sample(list(models), len(models)):
             first = starts[model] ^ bool(round_id % 2)
             for fast in (first, not first):
                 result.append(Trial(round_id, f"{round_id}:{model}", model, fast))
@@ -554,9 +568,9 @@ def bootstrap_interval(values: list[float], seed: int, draws: int = 2000) -> lis
     return [quantile(0.025), quantile(0.975)]
 
 
-def summarize(samples: list[dict[str, Any]], seed: int) -> dict[str, Any]:
+def summarize(samples: list[dict[str, Any]], seed: int, models: tuple[str, ...] = MODELS) -> dict[str, Any]:
     per_model: dict[str, Any] = {}
-    for model in MODELS:
+    for model in models:
         rows = [row for row in samples if row["model"] == model]
         groups: dict[tuple[int, str], dict[bool, dict[str, Any]]] = {}
         for row in rows:
@@ -743,7 +757,7 @@ async def run(
     journal: Path | None = None,
     campaign_timeout: float | None = None,
 ) -> dict[str, Any]:
-    trials = schedule(seed, rounds)
+    trials = schedule(seed, rounds, config.models)
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be positive and finite")
     if campaign_timeout is not None and (not math.isfinite(campaign_timeout) or campaign_timeout <= 0):
@@ -779,7 +793,7 @@ async def run(
         "target_visible_tokens": [300, 600],
         "target_words": 350,
         "samples": samples,
-        "summary": summarize(samples, seed),
+        "summary": summarize(samples, seed, config.models),
     }
 
 

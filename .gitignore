@@ -1,6 +1,7 @@
 # Project-specific
 refs/
 poc/
+scripts/qa/artifacts/
 
 # Python
 .venv/

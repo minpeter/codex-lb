@@ -36,6 +36,170 @@ from scripts.qa.fast_benchmark import (
 )
 
 
+@pytest.mark.asyncio
+async def test_load_config_accepts_configured_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "base_url": "https://example.test/v1",
+                "models": ["gpt-5.6-sol"],
+                "keys": {"gpt-5.6-sol": "dummy"},
+                "reasoning_effort": {"gpt-5.6-sol": "low"},
+                "standard_tier_unenforced_verified": True,
+                "single_account_per_model_verified": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    config = load_config(path)
+    assert config.models == ("gpt-5.6-sol",)
+    trials = schedule(2, 10, config.models)
+    assert len(trials) == 20
+    assert sum(t.fast for t in trials) == 10
+    assert sum(t.fast for t in trials[::2]) == 5
+    assert {t.model for t in trials} == {"gpt-5.6-sol"}
+
+    async def fake_request(session, cfg, trial, timeout, surface):
+        payload = request_payload(cfg, trial, surface)
+        assert payload["model"] == "gpt-5.6-sol"
+        assert payload["reasoning"] == {"effort": "low"}
+        assert payload.get("service_tier") == ("priority" if trial.fast else None)
+        return sample(trial.model, trial.round, trial.fast, 1.0)
+
+    monkeypatch.setattr("scripts.qa.fast_benchmark.request", fake_request)
+    result = await run(config, 10, 2, 5.0, journal=tmp_path / "run.jsonl")
+    assert len(result["samples"]) == 20
+    assert set(result["summary"]["per_model"]) == {"gpt-5.6-sol"}
+    assert result["summary"]["per_model"]["gpt-5.6-sol"]["paired"]["e2e_seconds"]["n"] == 10
+
+
+@pytest.mark.asyncio
+async def test_load_config_propagates_multiple_custom_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "base_url": "https://example.test/v1",
+                "models": ["custom-low", "custom-minimal"],
+                "keys": {
+                    "custom-low": "dummy-low",
+                    "custom-minimal": "dummy-minimal",
+                    "ignored-model": "dummy-ignored",
+                },
+                "reasoning_effort": {
+                    "custom-minimal": "minimal",
+                    "ignored-model": "minimal",
+                },
+                "standard_tier_unenforced_verified": True,
+                "single_account_per_model_verified": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    config = load_config(path)
+    assert config.models == ("custom-low", "custom-minimal")
+    assert config.keys == {
+        "custom-low": "dummy-low",
+        "custom-minimal": "dummy-minimal",
+    }
+    assert config.reasoning_effort == {
+        "custom-low": "low",
+        "custom-minimal": "minimal",
+    }
+
+    seen_trials = []
+    seen_payloads = []
+
+    async def fake_request(session, cfg, trial, timeout, surface):
+        seen_trials.append(trial)
+        seen_payloads.append(request_payload(cfg, trial, surface))
+        return {
+            **sample(trial.model, trial.round, trial.fast, 1.0),
+            "pair_id": trial.pair_id,
+        }
+
+    monkeypatch.setattr("scripts.qa.fast_benchmark.request", fake_request)
+    journal = tmp_path / "run.jsonl"
+    result = await run(config, 4, 23, 5.0, journal=journal)
+
+    assert len(seen_trials) == 16
+    assert {trial.model for trial in seen_trials} == {"custom-low", "custom-minimal"}
+    for first, second in zip(seen_trials[::2], seen_trials[1::2], strict=True):
+        assert first.model == second.model
+        assert first.pair_id == second.pair_id
+        assert first.fast is not second.fast
+    for model in config.models:
+        starts = [
+            seen_trials[index].fast for index in range(0, len(seen_trials), 2) if seen_trials[index].model == model
+        ]
+        assert sum(starts) == 2
+
+    assert {(payload["model"], payload["reasoning"]["effort"]) for payload in seen_payloads} == {
+        ("custom-low", "low"),
+        ("custom-minimal", "minimal"),
+    }
+    assert sum("service_tier" in payload for payload in seen_payloads) == 8
+    assert set(result["summary"]["per_model"]) == {"custom-low", "custom-minimal"}
+    for model in config.models:
+        model_summary = result["summary"]["per_model"][model]
+        assert model_summary["attempts"] == 8
+        assert model_summary["paired"]["e2e_seconds"]["n"] == 4
+    assert [json.loads(line) for line in journal.read_text().splitlines()] == [
+        {**row, "seed": 23} for row in result["samples"]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("models", "keys"),
+    [
+        (None, dict.fromkeys(MODELS, "dummy")),
+        ([], {}),
+        ("sol", {"sol": "dummy"}),
+        ([""], {"": "dummy"}),
+        (["sol sol"], {"sol sol": "dummy"}),
+        (["sol", "sol"], {"sol": "dummy"}),
+    ],
+)
+def test_load_config_rejects_invalid_model_names(tmp_path: Path, models: object, keys: dict[str, str]) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "base_url": "https://example.test/v1",
+                "models": models,
+                "keys": keys,
+                "standard_tier_unenforced_verified": True,
+                "single_account_per_model_verified": True,
+            }
+        )
+    )
+    path.chmod(0o600)
+    with pytest.raises(ValueError, match="models must"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("models", [[2], [{}]])
+def test_load_config_rejects_non_string_model_names(tmp_path: Path, models: list[object]) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "base_url": "https://example.test/v1",
+                "models": models,
+                "keys": dict.fromkeys(MODELS, "dummy"),
+                "standard_tier_unenforced_verified": True,
+                "single_account_per_model_verified": True,
+            }
+        )
+    )
+    path.chmod(0o600)
+    with pytest.raises(ValueError, match="models must"):
+        load_config(path)
+
+
 def event(kind: str, **values: object) -> bytes:
     return b"data: " + json.dumps({"type": kind, **values}, ensure_ascii=False).encode() + b"\r\n\r\n"
 
@@ -388,6 +552,36 @@ def test_surface_urls_stay_on_b(base: str) -> None:
     assert surface_url(cfg, "responses") == base + "/responses"
     assert surface_url(cfg, "chat") == base + "/chat/completions"
     assert surface_url(cfg, "codex") == base.removesuffix("/v1") + "/backend-api/codex/responses"
+
+
+def test_omitted_models_preserve_config_schedule_and_summary_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "defaults.json"
+    path.write_text(
+        json.dumps(
+            {
+                "base_url": "https://example.test/v1",
+                "keys": dict.fromkeys(MODELS, "dummy"),
+                "standard_tier_unenforced_verified": True,
+                "single_account_per_model_verified": True,
+            }
+        )
+    )
+    path.chmod(0o600)
+    loaded = load_config(path)
+    assert loaded.models == config().models == ("gpt-6-astra", "gpt-5.6-luna", "gpt-5.6-terra")
+    assert loaded.keys == dict.fromkeys(MODELS, "dummy")
+    assert loaded.reasoning_effort == dict.fromkeys(MODELS, "low")
+    assert loaded.headers == {}
+    headers = {"originator": "synthetic-client"}
+    positional = Config(loaded.base_url, loaded.keys, loaded.reasoning_effort, headers)
+    assert positional.headers == headers
+    assert positional.models == MODELS
+    trials = schedule(17, 10)
+    assert trials == schedule(17, 10, loaded.models)
+    assert len(trials) == 60
+    rows = [sample(trial.model, trial.round, trial.fast, 1.0) for trial in trials]
+    assert summarize(rows, 17) == summarize(rows, 17, loaded.models)
+    assert tuple(summarize([], 17)["per_model"]) == MODELS
 
 
 def test_default_payload_is_unchanged() -> None:
