@@ -78,6 +78,23 @@ Set a separate replica dashboard password and enable its own proxy API-key
 authentication before admitting remote client traffic. Source dashboard
 credentials must never be used as client API keys.
 
+## Host route recovery and preflight
+
+The replica host keeps Docker bridge traffic out of the Tailscale exit-node table with the checked-in `deploy/replica/docker-lan-routes.service`. The managed baseline is deliberately fixed to `172.17.0.0/16`, `172.18.0.0/16`, `172.19.0.0/16`, `172.28.0.0/16`, and `10.10.10.0/24`; it does not discover or autofix arbitrary Docker/private networks. Each owned exception is exactly priority `5199`, destination-specific, and `lookup main`. Unrelated rules for the same CIDR are preserved.
+
+Install or update only after reviewing the host receipt (the parent operator owns `/etc`):
+
+```bash
+sudo install -o root -g root -m 0644 deploy/replica/docker-lan-routes.service /etc/systemd/system/docker-lan-routes.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now docker-lan-routes.service
+python3 deploy/replica/route_preflight.py codex-lb-b
+```
+
+Preflight is read-only. It inspects the selected container's Docker attachment and IPAM, loaded unit commands/status, IPv4 policy rules, and the selected replica route. It emits JSON and exits nonzero for subnet drift, a missing/duplicate/wrong-selector `5199` rule, a wrong bridge route, stale unit state, malformed command output, or command failure. A nonzero result requires operator investigation; it must not be repaired by adding a new private-CIDR exception or disabling Tailscale.
+
+The lifecycle proof uses a disposable Docker network namespace with `NET_ADMIN`; it does not use host networking, restart Docker, restart the host, or restart Tailscale. Stop removes only priority `5199` `lookup main` rules and leaves other owners intact.
+
 ## Availability boundary
 
 The replica reduces dependency on the source's inference-handling process. It

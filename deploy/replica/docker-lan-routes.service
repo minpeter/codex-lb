@@ -1,0 +1,19 @@
+[Unit]
+Description=Keep Docker bridge and lab subnets off the Tailscale exit node
+Documentation=man:ip-rule(8)
+After=tailscaled.service docker.service
+Wants=tailscaled.service
+# tailscaled flushes policy rules on restart; reapply after it starts.
+PartOf=tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Baseline from /etc/systemd/system/docker-lan-routes.service, recovered 2026-09-10.
+# Own only pref 5199 + destination + main. Never delete a same-CIDR rule at another priority.
+# Query first: absence is success, but failed queries/deletes/adds must fail the service.
+ExecStart=/bin/sh -ec 'for net in 172.17.0.0/16 172.18.0.0/16 172.19.0.0/16 172.28.0.0/16 10.10.10.0/24; do rules=$$(ip -4 rule show pref 5199 to "$$net" lookup main); while [ -n "$$rules" ]; do ip -4 rule del pref 5199 to "$$net" lookup main; rules=$$(ip -4 rule show pref 5199 to "$$net" lookup main); done; ip -4 rule add pref 5199 to "$$net" lookup main; done'
+ExecStop=/bin/sh -ec 'for net in 172.17.0.0/16 172.18.0.0/16 172.19.0.0/16 172.28.0.0/16 10.10.10.0/24; do rules=$$(ip -4 rule show pref 5199 to "$$net" lookup main); while [ -n "$$rules" ]; do ip -4 rule del pref 5199 to "$$net" lookup main; rules=$$(ip -4 rule show pref 5199 to "$$net" lookup main); done; done'
+
+[Install]
+WantedBy=multi-user.target
